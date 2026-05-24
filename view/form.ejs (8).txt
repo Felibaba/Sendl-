@@ -1,0 +1,197 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title><%= title %></title>
+  <style>
+    :root {
+      --primary: #1564C0;
+      --primary-light: #3485e5;
+    }
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+    body {
+      font-family: 'Segoe UI', system-ui, Arial, sans-serif;
+      background: #FFFFFF;
+      color: #343a40;
+      line-height: 1.7;
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 20px;
+    }
+    .form-container {
+      max-width: 500px;
+      width: 100%;
+      background: #FFFFFF;
+      border-radius: 24px;
+      overflow: hidden;
+      box-shadow: 0 20px 60px rgba(0,0,0,0.08);
+      padding: 50px 40px 60px;
+      display: flex;
+      flex-direction: column;
+    }
+    h2 {
+      text-align: center;
+      font-size: 32px;
+      margin-bottom: 12px;
+    }
+    .subheader {
+      text-align: center;
+      color: #666;
+      margin-bottom: 40px;
+      font-size: 17px;
+    }
+    .input-group {
+      margin-bottom: 20px;
+    }
+    .input-group input {
+      width: 100%;
+      padding: 16px;
+      border-radius: 12px;
+      border: 1px solid #ddd;
+      font-size: 16px;
+      background: #fafbff;
+    }
+    button {
+      width: 100%;
+      padding: 18px;
+      margin-top: 20px;
+      background: var(--primary);
+      color: white;
+      border: none;
+      font-weight: 600;
+      cursor: pointer;
+      border-radius: 12px;
+      font-size: 18px;
+    }
+    button:hover {
+      background: var(--primary-light);
+    }
+
+    /* Tiny Join Sendmi button at the very bottom */
+    .tiny-footer-cta {
+      margin-top: auto;           /* pushes to bottom */
+      padding-top: 40px;
+      text-align: center;
+    }
+    .join-sendmi-btn {
+      display: inline-block;
+      padding: 6px 18px;          /* extremely small */
+      font-size: 12px;            /* tiny text */
+      font-weight: 500;
+      background: #0066FF;
+      color: white;
+      border-radius: 30px;
+      text-decoration: none;
+      box-shadow: 0 2px 8px rgba(0, 102, 255, 0.25);
+      transition: all 0.2s ease;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    }
+    .join-sendmi-btn:hover {
+      background: #0055dd;
+      transform: translateY(-1px);
+    }
+  </style>
+</head>
+<body>
+  <div class="form-container">
+    <div id="form-content"></div>
+
+    <!-- Very tiny Join Sendmi button – last element on page -->
+    <div class="tiny-footer-cta">
+      <a href="https://sendmi.onrender.com" class="join-sendmi-btn" target="_blank" rel="noopener">
+        Join Sendmi
+      </a>
+    </div>
+  </div>
+
+  <script>
+    const state = JSON.parse('<%- JSON.stringify(state || {}) %>');
+
+    const container = document.getElementById('form-content');
+
+    if (state.headerText) {
+      const h2 = document.createElement('h2');
+      h2.textContent = state.headerText;
+      container.appendChild(h2);
+    }
+
+    if (state.subheaderText) {
+      const p = document.createElement('p');
+      p.className = 'subheader';
+      p.textContent = state.subheaderText;
+      container.appendChild(p);
+    }
+
+    if (Array.isArray(state.placeholders)) {
+      state.placeholders.forEach(field => {
+        const div = document.createElement('div');
+        div.className = 'input-group';
+        const input = document.createElement('input');
+        input.type = field.type || 'text';
+        input.placeholder = field.placeholder || '';
+        input.required = field.required || false;
+        div.appendChild(input);
+        container.appendChild(div);
+      });
+    }
+
+    const button = document.createElement('button');
+    button.textContent = state.buttonText || 'Subscribe';
+    button.style.background = state.buttonColor || 'var(--primary)';
+    button.style.color = state.buttonTextColor || '#ffffff';
+    container.appendChild(button);
+
+    button.addEventListener('click', async (e) => {
+      e.preventDefault();
+      const inputs = container.querySelectorAll('input');
+      let name = '';
+      let email = '';
+      inputs.forEach(i => {
+        const ph = (i.placeholder || '').toLowerCase();
+        if (ph.includes('name')) name = i.value.trim();
+        if (ph.includes('email') || ph.includes('phone')) email = i.value.trim();
+      });
+
+      if (!name || !email) {
+        alert('Please fill name and contact');
+        return;
+      }
+
+      button.disabled = true;
+      button.textContent = 'Processing...';
+
+      const pathParts = window.location.pathname.split('/');
+      const shortId = pathParts[pathParts.length - 1];
+
+      try {
+        const res = await fetch('/api/subscribe/' + shortId, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name: name, email: email })
+        });
+        const data = await res.json();
+
+        if (data.success) {
+          const tgLink = 'https://t.me/' + data.deepLink.split('?start=')[0].replace('https://t.me/', '') + '?start=' + data.deepLink.split('?start=')[1];
+          window.location.href = tgLink;
+        } else {
+          alert(data.error || 'Subscription failed');
+          button.disabled = false;
+          button.textContent = state.buttonText || 'Subscribe';
+        }
+      } catch (err) {
+        alert('Network error');
+        button.disabled = false;
+        button.textContent = state.buttonText || 'Subscribe';
+      }
+    });
+  </script>
+</body>
+</html>
