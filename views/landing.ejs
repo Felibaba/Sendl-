@@ -40,7 +40,7 @@
       flex: 1;
       display: flex;
       flex-direction: column;
-      align-items: flex-end;
+      align-items: flex-start;   /* ← Changed to left alignment */
       gap: var(--gap-small);
     }
     h1 {
@@ -135,16 +135,15 @@
       text-align: center;
       background: #FFFFFF;
       margin-top: auto;
-      font-size: 13px;           /* slightly smaller than body text */
+      font-size: 13px;
       color: #666;
     }
 
-    /* New tiny underlined link style for footer */
     .footer-link {
       color: var(--primary);
       text-decoration: underline;
       text-underline-offset: 2px;
-      font-size: 12px;           /* tiny size */
+      font-size: 12px;
       font-weight: 500;
       transition: color 0.2s ease;
     }
@@ -152,7 +151,7 @@
     .footer-link:hover,
     .footer-link:focus {
       color: var(--primary-light);
-      text-decoration-thickness: 1.5px; /* optional: slightly thicker on hover */
+      text-decoration-thickness: 1.5px;
     }
   </style>
 </head>
@@ -193,11 +192,11 @@
     </div>
 
     <div class="footer-cta">
-      <a href="https://sendmi.onrender.com" 
+      <a href="https://sendi.onrender.com" 
          class="footer-link" 
          target="_blank" 
          rel="noopener">
-        Join Sendmi
+        Join Sendi
       </a>
     </div>
   </div>
