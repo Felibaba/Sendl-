@@ -1,0 +1,176 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>404 — Not Found</title>
+  <link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=IBM+Plex+Mono:wght@300;400&display=swap" rel="stylesheet">
+  <style>
+    *, *::before, *::after {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    :root {
+      --black: #0a0a0a;
+      --white: #f5f5f0;
+      --grey: #888;
+    }
+
+    html, body {
+      height: 100%;
+    }
+
+    body {
+      background: var(--black);
+      color: var(--white);
+      font-family: 'IBM Plex Mono', monospace;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      min-height: 100vh;
+      overflow: hidden;
+      position: relative;
+    }
+
+    /* Scanline overlay */
+    body::before {
+      content: '';
+      position: fixed;
+      inset: 0;
+      background: repeating-linear-gradient(
+        0deg,
+        transparent,
+        transparent 2px,
+        rgba(255,255,255,0.015) 2px,
+        rgba(255,255,255,0.015) 4px
+      );
+      pointer-events: none;
+      z-index: 10;
+    }
+
+    /* Noise grain */
+    body::after {
+      content: '';
+      position: fixed;
+      inset: -50%;
+      width: 200%;
+      height: 200%;
+      background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='noise'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23noise)' opacity='0.06'/%3E%3C/svg%3E");
+      pointer-events: none;
+      opacity: 0.4;
+      z-index: 9;
+      animation: grain 0.8s steps(2) infinite;
+    }
+
+    @keyframes grain {
+      0%, 100% { transform: translate(0, 0); }
+      25%       { transform: translate(-2%, -3%); }
+      50%       { transform: translate(3%, 1%); }
+      75%       { transform: translate(-1%, 4%); }
+    }
+
+    .container {
+      position: relative;
+      z-index: 20;
+      text-align: center;
+      padding: 40px 24px;
+      max-width: 600px;
+      width: 100%;
+      animation: fadeUp 0.6s ease both;
+    }
+
+    @keyframes fadeUp {
+      from { opacity: 0; transform: translateY(20px); }
+      to   { opacity: 1; transform: translateY(0); }
+    }
+
+    .error-code {
+      font-family: 'Bebas Neue', sans-serif;
+      font-size: clamp(140px, 28vw, 220px);
+      line-height: 0.85;
+      letter-spacing: -4px;
+      color: transparent;
+      -webkit-text-stroke: 1.5px var(--white);
+      user-select: none;
+      animation: flicker 6s infinite;
+    }
+
+    @keyframes flicker {
+      0%, 96%, 100% { opacity: 1; }
+      97%            { opacity: 0.6; }
+      98%            { opacity: 1; }
+      99%            { opacity: 0.3; }
+    }
+
+    .divider {
+      width: 40px;
+      height: 1px;
+      background: var(--grey);
+      margin: 28px auto;
+    }
+
+    .label {
+      font-size: 10px;
+      letter-spacing: 0.3em;
+      text-transform: uppercase;
+      color: var(--grey);
+      margin-bottom: 12px;
+    }
+
+    .message {
+      font-size: 15px;
+      font-weight: 300;
+      color: var(--white);
+      line-height: 1.7;
+      opacity: 0.75;
+    }
+
+    .back-link {
+      display: inline-block;
+      margin-top: 40px;
+      padding: 11px 28px;
+      border: 1px solid rgba(255,255,255,0.25);
+      color: var(--white);
+      text-decoration: none;
+      font-size: 11px;
+      letter-spacing: 0.2em;
+      text-transform: uppercase;
+      transition: background 0.2s, border-color 0.2s, color 0.2s;
+    }
+
+    .back-link:hover {
+      background: var(--white);
+      color: var(--black);
+      border-color: var(--white);
+    }
+
+    .coords {
+      position: fixed;
+      bottom: 24px;
+      left: 50%;
+      transform: translateX(-50%);
+      font-size: 10px;
+      letter-spacing: 0.2em;
+      color: rgba(255,255,255,0.18);
+      z-index: 20;
+      white-space: nowrap;
+    }
+  </style>
+</head>
+<body>
+
+  <div class="container">
+    <div class="error-code">404</div>
+    <div class="divider"></div>
+    <p class="label">Page not found</p>
+    <p class="message">The page you're looking for doesn't exist<br>or may have been removed.</p>
+    <a class="back-link" href="/">← Go home</a>
+  </div>
+
+  <p class="coords">ERR_NOT_FOUND &nbsp;/&nbsp; SENDLI</p>
+
+</body>
+</html>
