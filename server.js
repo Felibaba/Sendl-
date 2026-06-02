@@ -50,8 +50,11 @@ if (PAYSTACK_SECRET_KEY.startsWith('sk_test_fallback')) {
 const MONTHLY_PRICE_KOBO = 150000; // ₦5,000 in kobo
 
 // Batching config
+// 25 messages sent in parallel per batch, then 1 second delay before next batch.
+// This keeps throughput at ~25 msg/sec — safely under Telegram's 30 msg/sec hard limit.
+// At this rate, 10,000 subscribers are reached in ~7 minutes instead of ~53 minutes.
 const BATCH_SIZE = 25;
-const BATCH_INTERVAL_MS = 8000;
+const BATCH_DELAY_MS = 1000;
 const MAX_MSG_LENGTH = 4000;
 
 // Redis + BullMQ setup
@@ -286,20 +289,12 @@ broadcastDailySchema.index({ userId: 1, date: 1 }, { unique: true });
 const activeBots = new Map();
 const resetTokens = new Map();
 const pendingSubscribers = new Map();
-const lastWebhookSetTime = new Map();
 
 // ==================== TELEGRAM BOT MANAGEMENT ====================
-function launchUserBot(user) {
-  // Remove old bot instance without calling .stop() (not needed in pure webhook mode)
-  if (activeBots.has(user.id)) {
-    activeBots.delete(user.id);
-    console.log('Removed old bot instance for user ' + user.email + ' without stopping (webhook mode)');
-  }
 
-  if (!user.telegramBotToken) return;
-
-  const bot = new Telegraf(user.telegramBotToken);
-
+// Registers bot command/event handlers and adds instance to activeBots.
+// Does NOT make any Telegram API calls — safe to call at any time.
+function registerBotHandlers(user, bot) {
   bot.webhookReply = false;
   bot.options.webhookReply = false;
 
@@ -393,81 +388,76 @@ function launchUserBot(user) {
     await ctx.replyWithHTML('<b>Sendm 2FA Status</b>\nAccount: <code>' + user.email + '</code>\nStatus: <b>' + (user.isTelegramConnected ? 'Connected' : 'Not Connected') + '</b>');
   });
 
+  activeBots.set(user.id, bot);
+}
+
+// Sets the Telegram webhook for a user's bot.
+// Only called when a token is first connected or changed.
+async function setupBotWebhook(user) {
+  if (!user.telegramBotToken) return;
+
   const webhookPath = '/webhook/' + WEBHOOK_SECRET + '/' + user.id;
   const webhookUrl = 'https://' + DOMAIN + webhookPath;
 
-  (async () => {
-    try {
-      const current = await bot.telegram.getWebhookInfo();
+  const bot = activeBots.get(user.id);
+  if (!bot) {
+    console.error('setupBotWebhook called but no bot instance found for ' + user.email);
+    return;
+  }
 
-      const alreadyCorrect =
-        current.url === webhookUrl &&
-        !current.has_custom_certificate &&
-        current.pending_update_count < 50;
+  try {
+    await bot.telegram.deleteWebhook({ drop_pending_updates: true });
+    console.log('Webhook cleaned for ' + user.email);
 
-      const lastSet = lastWebhookSetTime.get(user.id) || 0;
-      const recentlySet = Date.now() - lastSet < 30 * 60 * 1000;
+    await new Promise(resolve => setTimeout(resolve, 4000));
+    await new Promise(resolve => setTimeout(resolve, 2500));
 
-      if (alreadyCorrect && recentlySet) {
-        console.log('Webhook already perfect & recent for ' + user.email + ' → skipping');
-        activeBots.set(user.id, bot);
-        return;
-      }
+    let attempts = 0;
+    const maxAttempts = 5;
 
-      if (alreadyCorrect) {
-        console.log('Webhook correct but old → refreshing timestamp for ' + user.email);
-        lastWebhookSetTime.set(user.id, Date.now());
-        activeBots.set(user.id, bot);
-        return;
-      }
+    while (attempts < maxAttempts) {
+      try {
+        const success = await bot.telegram.setWebhook(webhookUrl, {
+          allowed_updates: ['message', 'callback_query', 'my_chat_member']
+        });
 
-      console.log('Webhook needs update for ' + user.email + ' → current: ' + (current.url || 'none'));
-
-      await bot.telegram.deleteWebhook({ drop_pending_updates: true });
-      console.log('Webhook cleaned for ' + user.email);
-
-      await new Promise(resolve => setTimeout(resolve, 4000));
-      await new Promise(resolve => setTimeout(resolve, 2500));
-
-      let attempts = 0;
-      const maxAttempts = 5; // Increased attempts for network reliability
-
-      while (attempts < maxAttempts) {
-        try {
-          const success = await bot.telegram.setWebhook(webhookUrl, {
-            allowed_updates: ['message', 'callback_query', 'my_chat_member']
-          });
-
-          if (success) {
-            console.log('Webhook SUCCESSFULLY set for @' + (user.botUsername || 'unknown') + ' → ' + webhookUrl);
-            lastWebhookSetTime.set(user.id, Date.now());
-            activeBots.set(user.id, bot);
-            return;
-          }
-        } catch (err) {
-          attempts++;
-          if (err.response && err.response.error_code === 429) {
-            const retryAfter = err.response.parameters?.retry_after || 30;
-            console.warn('Rate limit hit for ' + user.email + ' - waiting ' + (retryAfter + 5) + 's (attempt ' + attempts + '/' + maxAttempts + ')');
-            await new Promise(r => setTimeout(r, (retryAfter + 5) * 1000));
-          } else {
-            console.error('Webhook set FAILED for ' + user.email + ': ' + err.message);
-            if (attempts >= maxAttempts) {
-              throw err;
-            }
-            await new Promise(r => setTimeout(r, 5000)); // Extra delay on failure
-          }
+        if (success) {
+          console.log('Webhook SUCCESSFULLY set for @' + (user.botUsername || 'unknown') + ' → ' + webhookUrl);
+          return;
+        }
+      } catch (err) {
+        attempts++;
+        if (err.response && err.response.error_code === 429) {
+          const retryAfter = err.response.parameters?.retry_after || 30;
+          console.warn('Rate limit hit for ' + user.email + ' - waiting ' + (retryAfter + 5) + 's (attempt ' + attempts + '/' + maxAttempts + ')');
+          await new Promise(r => setTimeout(r, (retryAfter + 5) * 1000));
+        } else {
+          console.error('Webhook set FAILED for ' + user.email + ': ' + err.message);
+          if (attempts >= maxAttempts) throw err;
+          await new Promise(r => setTimeout(r, 5000));
         }
       }
-
-      console.error('Gave up setting webhook for ' + user.email + ' after ' + maxAttempts + ' attempts');
-    } catch (err) {
-      console.error('Webhook setup completely failed for ' + user.email + ': ' + err.message);
-    } finally {
-      // Always register the bot instance even if webhook failed (it can still handle incoming updates)
-      activeBots.set(user.id, bot);
     }
-  })();
+
+    console.error('Gave up setting webhook for ' + user.email + ' after ' + maxAttempts + ' attempts');
+  } catch (err) {
+    console.error('Webhook setup completely failed for ' + user.email + ': ' + err.message);
+  }
+}
+
+// Creates a bot instance with handlers registered. No API calls made here.
+// Call setupBotWebhook(user) separately when the token is first connected or changed.
+function registerBot(user) {
+  if (!user.telegramBotToken) return;
+
+  // Remove any existing instance first
+  if (activeBots.has(user.id)) {
+    activeBots.delete(user.id);
+  }
+
+  const bot = new Telegraf(user.telegramBotToken);
+  registerBotHandlers(user, bot);
+  console.log('Bot handlers registered for ' + user.email + ' (lazy webhook mode)');
 }
 
 // ==================== MIDDLEWARE ====================
@@ -499,9 +489,24 @@ const formSubmitLimiter = rateLimit({
 });
 
 // ==================== WEBHOOK ENDPOINT ====================
+// Lazily hydrates the bot instance on first incoming update if not already loaded.
 app.post('/webhook/' + WEBHOOK_SECRET + '/:userId', async (req, res) => {
   const userId = req.params.userId;
-  const bot = activeBots.get(userId);
+  let bot = activeBots.get(userId);
+
+  // Lazy hydration: if no bot instance in memory, load user from DB and register handlers
+  if (!bot) {
+    try {
+      const user = await User.findOne({ id: userId });
+      if (user && user.telegramBotToken) {
+        registerBot(user);
+        bot = activeBots.get(userId);
+        console.log('Lazily hydrated bot for user ' + user.email + ' on incoming webhook');
+      }
+    } catch (err) {
+      console.error('Failed to lazily hydrate bot for user ' + userId + ':', err.message);
+    }
+  }
 
   let update;
   try {
@@ -666,11 +671,13 @@ async function processBroadcast(job) {
 
   const chunks = splitTelegramMessage(message);
 
+  // .lean() returns plain JS objects instead of full Mongoose documents.
+  // For large lists (10k+ contacts) this is 3-5x faster and uses far less memory.
   const targets = await Contact.find({
     userId: userId,
     status: 'subscribed',
     telegramChatId: { $exists: true, $ne: null }
-  });
+  }).lean();
 
   const total = targets.length;
   let sent = 0;
@@ -681,10 +688,14 @@ async function processBroadcast(job) {
     batches.push(targets.slice(i, i + BATCH_SIZE));
   }
 
+  // Collect blocked contact IDs in memory and bulk-write at end.
+  // Old code did one DB round-trip per blocked user — this does one total.
+  const unsubscribedIds = [];
+
   for (let b = 0; b < batches.length; b++) {
     const batch = batches[b];
 
-    const sendPromises = batch.map(async function(target) {
+    await Promise.all(batch.map(async function(target) {
       try {
         for (const chunk of chunks) {
           await bot.telegram.sendMessage(target.telegramChatId, chunk, { parse_mode: 'HTML' });
@@ -695,20 +706,23 @@ async function processBroadcast(job) {
         const isBlocked = err.response?.error_code === 403 ||
           /blocked|forbidden|chat not found|deactivated/i.test(err.message || '');
         if (isBlocked) {
-          await Contact.findByIdAndUpdate(target._id, {
-            status: 'unsubscribed',
-            unsubscribedAt: new Date(),
-            telegramChatId: null
-          });
+          unsubscribedIds.push(target._id);
         }
       }
-    });
+    }));
 
-    await Promise.all(sendPromises);
-
+    // 1 second between batches keeps throughput at ~25 msg/sec — under Telegram's 30/sec limit.
     if (b < batches.length - 1) {
-      await new Promise(resolve => setTimeout(resolve, BATCH_INTERVAL_MS));
+      await new Promise(resolve => setTimeout(resolve, BATCH_DELAY_MS));
     }
+  }
+
+  // Single bulk DB update for all blocked/deactivated contacts
+  if (unsubscribedIds.length > 0) {
+    await Contact.updateMany(
+      { _id: { $in: unsubscribedIds } },
+      { status: 'unsubscribed', unsubscribedAt: new Date(), telegramChatId: null }
+    );
   }
 
   const user = await User.findOne({ id: userId });
@@ -717,8 +731,8 @@ async function processBroadcast(job) {
     reportText += 'No subscribed contacts with Telegram connected.';
   } else {
     const emoji = failed === 0 ? '✅' : '⚠️';
-    reportText += '(' + emoji + ' <b>' + sent + ' of ' + total + '</b> delivered.\n';
-    if (failed > 0) reportText += failed + ' failed.';
+    reportText += emoji + ' <b>' + sent + ' of ' + total + '</b> delivered.';
+    if (failed > 0) reportText += '\n' + failed + ' failed (blocked/deactivated accounts removed).';
   }
   reportText += '\n\nTime: ' + new Date().toLocaleString();
 
@@ -920,12 +934,12 @@ app.post('/api/auth/connect-telegram', authenticateToken, async function(req, re
   // Retry validation for network issues
   let botInfo;
   let attempts = 0;
-  const maxAttempts = 7; // Increased retries
+  const maxAttempts = 7;
   while (attempts < maxAttempts) {
     attempts++;
     try {
       const response = await axios.get('https://api.telegram.org/bot' + token + '/getMe', {
-        timeout: 20000 // Increased timeout
+        timeout: 20000
       });
       if (!response.data.ok) {
         return res.status(400).json({ 
@@ -942,7 +956,7 @@ app.post('/api/auth/connect-telegram', authenticateToken, async function(req, re
       if (attempts >= maxAttempts) {
         return res.status(500).json({ error: 'Network error validating bot token. Please try again later.' });
       }
-      await new Promise(r => setTimeout(r, 8000)); // Longer backoff
+      await new Promise(r => setTimeout(r, 8000));
     }
   }
 
@@ -966,7 +980,9 @@ app.post('/api/auth/connect-telegram', authenticateToken, async function(req, re
   req.user.telegramChatId = null;
   await req.user.save();
 
-  launchUserBot(req.user);
+  // Register handlers then set the webhook (only time we call the Telegram API for webhook setup)
+  registerBot(req.user);
+  await setupBotWebhook(req.user);
 
   const startLink = 'https://t.me/' + botUsername + '?start=' + req.user.id;
 
@@ -1038,7 +1054,9 @@ app.post('/api/auth/change-bot-token', authenticateToken, async function(req, re
   req.user.telegramChatId = null;
   await req.user.save();
 
-  launchUserBot(req.user);
+  // Register handlers then set the webhook for the new token
+  registerBot(req.user);
+  await setupBotWebhook(req.user);
 
   const startLink = 'https://t.me/' + botUsername + '?start=' + req.user.id;
 
@@ -1063,7 +1081,7 @@ app.post('/api/auth/disconnect-telegram', authenticateToken, async function(req,
     }
   }
 
-  // Remove bot instance without .stop()
+  // Remove bot instance
   if (activeBots.has(req.user.id)) {
     activeBots.delete(req.user.id);
   }
@@ -1110,6 +1128,11 @@ app.post('/api/auth/forgot-password', async function(req, res) {
   const user = await User.findOne({ email: email.toLowerCase() });
   if (!user) return res.json({ success: true, message: 'If account exists, code was sent.' });
   if (!user.isTelegramConnected) return res.status(400).json({ error: 'Telegram 2FA not connected' });
+
+  // Ensure bot is loaded before trying to send a message
+  if (!activeBots.has(user.id) && user.telegramBotToken) {
+    registerBot(user);
+  }
 
   const code = generate2FACode();
   const resetToken = uuidv4();
@@ -1247,7 +1270,7 @@ app.post('/api/subscription/webhook', async function(req, res) {
 });
 
 app.get('/subscription-success', function(req, res) {
-  res.send('<!DOCTYPE html>\n<html lang="en">\n<head>\n  <meta charset="UTF-8">\n  <title>Payment Successful</title>\n  <style>\n    body{font-family:system-ui,sans-serif;background:#0a0a0a;color:#00ff41;display:flex;justify-content:center;align-items:center;min-height:100vh;margin:0;}\n    .box{background:#111;padding:60px;border-radius:20px;text-align:center;box-shadow:0 0 30px rgba(0,255,65,0.2);}\n    h1{margin:0 0 20px;font-size:3em;color:#00ff41;}\n    p{font-size:1.3em;margin:20px 0;line-height:1.6;}\n    a{display:inline-block;margin-top:30px;padding:14px 32px;background:#00ff41;color:#000;font-weight:bold;text-decoration:none;border-radius:8px;font-size:1.1em;}\n    a:hover{background:#00cc33;}\n  </style>\n</head>\n<body>\n  <div class="box">\n    <h1>✓ Payment Successful!</h1>\n    <p>Your subscription is now <strong>active</strong>.</p>\n    <p>You have unlimited broadcasts, landing pages, and forms.</p>\n    <p><a href="https://sendi.onrender.com">← Return to Dashboard</a></p>\n  </div>\n</body>\n</html>');
+  res.send('<!DOCTYPE html>\n<html lang="en">\n<head>\n  <meta charset="UTF-8">\n  <title>Payment Successful</title>\n  <style>\n    body{font-family:system-ui,sans-serif;background:#0a0a0a;color:#00ff41;display:flex;justify-content:center;align-items:center;min-height:100vh;margin:0;}\n    .box{background:#111;padding:60px;border-radius:20px;text-align:center;box-shadow:0 0 30px rgba(0,255,65,0.2);}\n    h1{margin:0 0 20px;font-size:3em;color:#00ff41;}\n    p{font-size:1.3em;margin:20px 0;line-height:1.6;}\n    a{display:inline-block;margin-top:30px;padding:14px 32px;background:#00ff41;color:#000;font-weight:bold;text-decoration:none;border-radius:8px;font-size:1.1em;}\n    a:hover{background:#00cc33;}\n  </style>\n</head>\n<body>\n  <div class="box">\n    <h1>✓ Payment Successful!</h1>\n    <p>Your subscription is now <strong>active</strong>.</p>\n    <p>You have unlimited broadcasts, landing pages, and forms.</p>\n    <p><a href="https://sendmi.onrender.com">← Return to Dashboard</a></p>\n  </div>\n</body>\n</html>');
 });
 
 // ==================== CACHED HIGH-READ ENDPOINTS ====================
@@ -1663,21 +1686,22 @@ app.post('/api/broadcast/schedule', authenticateToken, async function(req, res) 
     return res.status(400).json({ error: 'Message too long' });
   }
 
+  // Validate time BEFORE incrementing the daily count
+  const time = new Date(scheduledTime);
+  if (isNaN(time.getTime()) || time <= new Date()) {
+    return res.status(400).json({ error: 'Invalid future time' });
+  }
+
   const todayCount = await incrementDailyBroadcast(req.user.id);
   const limits = getUserLimits(req.user);
   if (todayCount > limits.dailyBroadcasts && limits.dailyBroadcasts !== Infinity) {
     return res.status(403).json({ error: 'Daily broadcast limit reached.' });
   }
 
-  const time = new Date(scheduledTime);
-  if (isNaN(time.getTime()) || time <= new Date()) {
-    return res.status(400).json({ error: 'Invalid future time' });
-  }
-
   const readyMessage = prepareTelegramMessage(processed);
   const broadcastId = uuidv4();
 
-  const broadcast = await ScheduledBroadcast.create({
+  await ScheduledBroadcast.create({
     broadcastId: broadcastId,
     userId: req.user.id,
     message: readyMessage,
@@ -1955,11 +1979,9 @@ async function loadAdminSettings() {
 mongoose.connection.once('open', async function() {
   await loadAdminSettings();
 
-  const usersWithBots = await User.find({ telegramBotToken: { $exists: true, $ne: null } });
-  for (const user of usersWithBots) {
-    launchUserBot(user);
-  }
-  console.log('Launched ' + usersWithBots.length + ' bots in pure webhook mode');
+  // No bot launching on startup — bots are lazily hydrated on first
+  // incoming webhook or when a user connects/changes their token.
+  console.log('✅ Startup complete — bots will hydrate lazily on first use');
 
   await recoverLostScheduledBroadcasts();
 
@@ -1992,4 +2014,3 @@ app.listen(PORT, function() {
   console.log('\nSENDEM SERVER — FULL VERSION WITH BullMQ + Redis BROADCAST QUEUE');
   console.log('Server running on port ' + PORT + ' | Domain: https://' + DOMAIN + '\n');
 });
-
