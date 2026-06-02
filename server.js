@@ -814,8 +814,13 @@ async function recoverLostScheduledBroadcasts() {
 
     const existing = await broadcastQueue.getJob(jobId);
     if (existing) {
-      alreadyExists++;
-      continue;
+      const state = await existing.getState();
+      // Only skip if genuinely waiting/delayed/active — remove stale completed/failed jobs
+      if (state === 'waiting' || state === 'delayed' || state === 'active') {
+        alreadyExists++;
+        continue;
+      }
+      await existing.remove();
     }
 
     const delayMs = task.scheduledTime.getTime() - Date.now();
@@ -1710,6 +1715,7 @@ app.post('/api/broadcast/schedule', authenticateToken, async function(req, res) 
 
   const readyMessage = prepareTelegramMessage(processed);
   const broadcastId = uuidv4();
+  const now = new Date();
 
   await ScheduledBroadcast.create({
     broadcastId: broadcastId,
@@ -1717,10 +1723,19 @@ app.post('/api/broadcast/schedule', authenticateToken, async function(req, res) 
     message: readyMessage,
     recipients: recipients,
     scheduledTime: time,
-    status: 'pending'
+    status: 'pending',
+    createdAt: now
   });
 
   const delay = time.getTime() - Date.now();
+
+  // Remove any existing job with this ID before adding — BullMQ silently
+  // ignores add() if a job with the same jobId already exists, which causes
+  // broadcasts to be stored in DB but never actually sent.
+  const existingJob = await broadcastQueue.getJob(broadcastId);
+  if (existingJob) {
+    await existingJob.remove();
+  }
 
   await broadcastQueue.add('send-broadcast', {
     userId: req.user.id,
