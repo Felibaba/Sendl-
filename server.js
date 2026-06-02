@@ -664,6 +664,16 @@ async function incrementDailyBroadcast(userId) {
 async function processBroadcast(job) {
   const { userId, message, broadcastId } = job.data;
 
+  // Lazily hydrate bot if not in memory (e.g. after a server restart
+  // where no webhook has fired yet for this user)
+  if (!activeBots.has(userId)) {
+    const userForBot = await User.findOne({ id: userId });
+    if (userForBot && userForBot.telegramBotToken) {
+      registerBot(userForBot);
+      console.log('Lazily hydrated bot for user ' + userId + ' inside broadcast worker');
+    }
+  }
+
   const bot = activeBots.get(userId);
   if (!bot) {
     throw new Error('Telegram bot not connected');
