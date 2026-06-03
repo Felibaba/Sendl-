@@ -75,7 +75,32 @@ if (process.env.REDIS_URL) {
   });
 }
 
+// ==================== REDIS DIAGNOSTICS ====================
+redisConnection.on('connect', function() {
+  console.log('✅ Redis connected');
+});
+
+redisConnection.on('ready', function() {
+  console.log('✅ Redis ready');
+});
+
+redisConnection.on('error', function(err) {
+  console.error('❌ Redis connection error:', err.message);
+});
+
+redisConnection.on('close', function() {
+  console.warn('⚠️ Redis connection closed');
+});
+
+redisConnection.on('reconnecting', function() {
+  console.warn('🔄 Redis reconnecting...');
+});
+
 const broadcastQueue = new Queue('telegram-broadcasts', { connection: redisConnection });
+
+broadcastQueue.on('error', function(err) {
+  console.error('❌ BullMQ Queue error:', err.message);
+});
 
 // ==================== CONTACT VALIDATION REGEX ====================
 const CONTACT_REGEX = /^(\+?[0-9\s\-\(\)]{7,20}|[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})$/;
@@ -110,7 +135,8 @@ function getUserCache(userId) {
   return bucket;
 }
 
-function invalidateUserCache(userId, type = 'all') {
+function invalidateUserCache(userId, type) {
+  type = type || 'all';
   const bucket = userCache.get(userId);
   if (!bucket) return;
 
@@ -133,7 +159,7 @@ function invalidatePublicCache(key) {
   publicCache.delete(key);
 }
 
-setInterval(() => {
+setInterval(function() {
   const now = Date.now();
   const INACTIVE_THRESHOLD = 30 * 60 * 1000;
 
@@ -166,14 +192,17 @@ mongoose.connect(MONGODB_URI, {
   serverSelectionTimeoutMS: 30000,
   socketTimeoutMS: 45000,
   connectTimeoutMS: 30000,
-}).then(() => {
+}).then(function() {
   console.log('✅ MongoDB connected');
-}).catch(err => {
+}).catch(function(err) {
   console.error('MongoDB connection failed:', err.message);
   process.exit(1);
 });
 
 // ==================== SCHEMAS & MODELS ====================
+// NOTE: All indexes must be defined on the schema BEFORE mongoose.model() is called.
+// Indexes added after model creation are silently ignored by Mongoose.
+
 const userSchema = new mongoose.Schema({
   id: { type: String, required: true, unique: true },
   fullName: String,
@@ -201,6 +230,9 @@ const landingPageSchema = new mongoose.Schema({
   updatedAt: Date,
 }, { timestamps: true });
 
+// FIX: indexes defined before mongoose.model()
+landingPageSchema.index({ userId: 1 });
+
 const formPageSchema = new mongoose.Schema({
   shortId: { type: String, required: true, unique: true },
   userId: { type: String, required: true },
@@ -210,6 +242,9 @@ const formPageSchema = new mongoose.Schema({
   createdAt: Date,
   updatedAt: Date,
 }, { timestamps: true });
+
+// FIX: indexes defined before mongoose.model()
+formPageSchema.index({ userId: 1 });
 
 const contactSchema = new mongoose.Schema({
   userId: { type: String, required: true },
@@ -223,6 +258,12 @@ const contactSchema = new mongoose.Schema({
   unsubscribedAt: Date,
 }, { timestamps: true });
 
+// FIX: indexes defined before mongoose.model()
+contactSchema.index({ userId: 1 });
+contactSchema.index({ userId: 1, contact: 1 });
+contactSchema.index({ userId: 1, telegramChatId: 1 });
+contactSchema.index({ userId: 1, status: 1 });
+
 const scheduledBroadcastSchema = new mongoose.Schema({
   broadcastId: { type: String, required: true, unique: true },
   userId: { type: String, required: true },
@@ -233,11 +274,23 @@ const scheduledBroadcastSchema = new mongoose.Schema({
   createdAt: Date,
 }, { timestamps: true });
 
+// FIX: indexes defined before mongoose.model()
+scheduledBroadcastSchema.index({ userId: 1 });
+scheduledBroadcastSchema.index({ status: 1 });
+scheduledBroadcastSchema.index({ scheduledTime: 1 });
+
 const broadcastDailySchema = new mongoose.Schema({
   userId: { type: String, required: true },
   date: { type: String, required: true },
   count: { type: Number, default: 1 },
 }, { timestamps: true });
+
+// FIX: unique compound index defined before mongoose.model()
+// Previously this was defined AFTER the model call, causing it to be silently
+// ignored. That broke the upsert in incrementDailyBroadcast() — duplicate
+// records were created instead of incrementing, making daily limit checks
+// unreliable and scheduled broadcasts to appear to succeed but not queue.
+broadcastDailySchema.index({ userId: 1, date: 1 }, { unique: true });
 
 const adminSettingsSchema = new mongoose.Schema({
   dailyBroadcastLimit: { type: Number, default: 3, min: 1 },
@@ -265,6 +318,7 @@ adminSettingsSchema.statics.updateSettings = async function(updates) {
   return settings;
 };
 
+// All models created after their schema indexes are fully defined
 const AdminSettings = mongoose.model('AdminSettings', adminSettingsSchema);
 const User = mongoose.model('User', userSchema);
 const LandingPage = mongoose.model('LandingPage', landingPageSchema);
@@ -272,18 +326,6 @@ const FormPage = mongoose.model('FormPage', formPageSchema);
 const Contact = mongoose.model('Contact', contactSchema);
 const ScheduledBroadcast = mongoose.model('ScheduledBroadcast', scheduledBroadcastSchema);
 const BroadcastDaily = mongoose.model('BroadcastDaily', broadcastDailySchema);
-
-// Indexes
-landingPageSchema.index({ userId: 1 });
-formPageSchema.index({ userId: 1 });
-contactSchema.index({ userId: 1 });
-contactSchema.index({ userId: 1, contact: 1 });
-contactSchema.index({ userId: 1, telegramChatId: 1 });
-contactSchema.index({ userId: 1, status: 1 });
-scheduledBroadcastSchema.index({ userId: 1 });
-scheduledBroadcastSchema.index({ status: 1 });
-scheduledBroadcastSchema.index({ scheduledTime: 1 });
-broadcastDailySchema.index({ userId: 1, date: 1 }, { unique: true });
 
 // In-memory helpers
 const activeBots = new Map();
@@ -298,7 +340,7 @@ function registerBotHandlers(user, bot) {
   bot.webhookReply = false;
   bot.options.webhookReply = false;
 
-  bot.catch((err) => {
+  bot.catch(function(err) {
     if (err.message && err.message.includes('Bot is not running')) {
       console.warn('Ignored expected "Bot is not running" warning in webhook mode for ' + user.email);
     } else {
@@ -306,7 +348,7 @@ function registerBotHandlers(user, bot) {
     }
   });
 
-  bot.start(async (ctx) => {
+  bot.start(async function(ctx) {
     const payload = ctx.startPayload || '';
     const chatId = ctx.chat.id.toString();
 
@@ -321,8 +363,8 @@ function registerBotHandlers(user, bot) {
         const contactsByEmail = await Contact.find({ userId: user.id, contact: sub.contact });
 
         if (!targetContact) {
-          targetContact = contactsByEmail.find(c => c.status === 'subscribed') ||
-                          contactsByEmail.find(c => c.shortId === sub.shortId) ||
+          targetContact = contactsByEmail.find(function(c) { return c.status === 'subscribed'; }) ||
+                          contactsByEmail.find(function(c) { return c.shortId === sub.shortId; }) ||
                           contactsByEmail[0];
         }
 
@@ -384,7 +426,7 @@ function registerBotHandlers(user, bot) {
     await ctx.replyWithHTML('<b>Welcome!</b>\n\nSubscribe from the page to get updates.');
   });
 
-  bot.command('status', async (ctx) => {
+  bot.command('status', async function(ctx) {
     await ctx.replyWithHTML('<b>Sendm 2FA Status</b>\nAccount: <code>' + user.email + '</code>\nStatus: <b>' + (user.isTelegramConnected ? 'Connected' : 'Not Connected') + '</b>');
   });
 
@@ -409,8 +451,8 @@ async function setupBotWebhook(user) {
     await bot.telegram.deleteWebhook({ drop_pending_updates: true });
     console.log('Webhook cleaned for ' + user.email);
 
-    await new Promise(resolve => setTimeout(resolve, 4000));
-    await new Promise(resolve => setTimeout(resolve, 2500));
+    await new Promise(function(resolve) { setTimeout(resolve, 4000); });
+    await new Promise(function(resolve) { setTimeout(resolve, 2500); });
 
     let attempts = 0;
     const maxAttempts = 5;
@@ -428,13 +470,13 @@ async function setupBotWebhook(user) {
       } catch (err) {
         attempts++;
         if (err.response && err.response.error_code === 429) {
-          const retryAfter = err.response.parameters?.retry_after || 30;
+          const retryAfter = (err.response.parameters && err.response.parameters.retry_after) || 30;
           console.warn('Rate limit hit for ' + user.email + ' - waiting ' + (retryAfter + 5) + 's (attempt ' + attempts + '/' + maxAttempts + ')');
-          await new Promise(r => setTimeout(r, (retryAfter + 5) * 1000));
+          await new Promise(function(r) { setTimeout(r, (retryAfter + 5) * 1000); });
         } else {
           console.error('Webhook set FAILED for ' + user.email + ': ' + err.message);
           if (attempts >= maxAttempts) throw err;
-          await new Promise(r => setTimeout(r, 5000));
+          await new Promise(function(r) { setTimeout(r, 5000); });
         }
       }
     }
@@ -490,7 +532,7 @@ const formSubmitLimiter = rateLimit({
 
 // ==================== WEBHOOK ENDPOINT ====================
 // Lazily hydrates the bot instance on first incoming update if not already loaded.
-app.post('/webhook/' + WEBHOOK_SECRET + '/:userId', async (req, res) => {
+app.post('/webhook/' + WEBHOOK_SECRET + '/:userId', async function(req, res) {
   const userId = req.params.userId;
   let bot = activeBots.get(userId);
 
@@ -575,7 +617,6 @@ function escapeHtml(unsafe) {
 
 function textToHtmlForDisplay(text) {
   if (!text) return '';
-  
   return text
     .replace(/\n{2,}/g, '</p><p>')
     .replace(/\n/g, '<br>');
@@ -664,6 +705,8 @@ async function incrementDailyBroadcast(userId) {
 async function processBroadcast(job) {
   const { userId, message, broadcastId } = job.data;
 
+  console.log('📤 Processing broadcast job ' + job.id + ' for user ' + userId + (broadcastId ? ' (scheduled: ' + broadcastId + ')' : ' (immediate)'));
+
   // Lazily hydrate bot if not in memory (e.g. after a server restart
   // where no webhook has fired yet for this user)
   if (!activeBots.has(userId)) {
@@ -676,7 +719,7 @@ async function processBroadcast(job) {
 
   const bot = activeBots.get(userId);
   if (!bot) {
-    throw new Error('Telegram bot not connected');
+    throw new Error('Telegram bot not connected for user ' + userId);
   }
 
   const chunks = splitTelegramMessage(message);
@@ -693,13 +736,14 @@ async function processBroadcast(job) {
   let sent = 0;
   let failed = 0;
 
+  console.log('📋 Broadcast job ' + job.id + ': sending to ' + total + ' subscribers');
+
   const batches = [];
   for (let i = 0; i < targets.length; i += BATCH_SIZE) {
     batches.push(targets.slice(i, i + BATCH_SIZE));
   }
 
   // Collect blocked contact IDs in memory and bulk-write at end.
-  // Old code did one DB round-trip per blocked user — this does one total.
   const unsubscribedIds = [];
 
   for (let b = 0; b < batches.length; b++) {
@@ -713,17 +757,19 @@ async function processBroadcast(job) {
         sent++;
       } catch (err) {
         failed++;
-        const isBlocked = err.response?.error_code === 403 ||
+        const isBlocked = (err.response && err.response.error_code === 403) ||
           /blocked|forbidden|chat not found|deactivated/i.test(err.message || '');
         if (isBlocked) {
           unsubscribedIds.push(target._id);
+        } else {
+          console.warn('Send failed for chatId ' + target.telegramChatId + ': ' + err.message);
         }
       }
     }));
 
     // 1 second between batches keeps throughput at ~25 msg/sec — under Telegram's 30/sec limit.
     if (b < batches.length - 1) {
-      await new Promise(resolve => setTimeout(resolve, BATCH_DELAY_MS));
+      await new Promise(function(resolve) { setTimeout(resolve, BATCH_DELAY_MS); });
     }
   }
 
@@ -750,15 +796,18 @@ async function processBroadcast(job) {
     try {
       await bot.telegram.sendMessage(user.telegramChatId, reportText, { parse_mode: 'HTML' });
     } catch (err) {
-      console.error('Failed to send report to user ' + userId, err);
+      console.error('Failed to send report to user ' + userId + ':', err.message);
     }
   }
 
   if (broadcastId) {
     await ScheduledBroadcast.deleteOne({ broadcastId: broadcastId });
+    console.log('✅ Scheduled broadcast ' + broadcastId + ' completed and removed from DB');
   }
 
   invalidateUserCache(userId, 'contacts');
+
+  console.log('✅ Broadcast job ' + job.id + ' done: ' + sent + ' sent, ' + failed + ' failed out of ' + total);
 }
 
 const worker = new Worker('telegram-broadcasts', processBroadcast, {
@@ -766,26 +815,75 @@ const worker = new Worker('telegram-broadcasts', processBroadcast, {
   concurrency: 4
 });
 
+// ==================== BULLMQ WORKER DIAGNOSTICS ====================
+worker.on('ready', function() {
+  console.log('✅ BullMQ Worker ready and listening for jobs');
+});
+
+worker.on('error', function(err) {
+  console.error('❌ BullMQ Worker error:', err.message);
+});
+
+worker.on('active', function(job) {
+  console.log('▶️  Broadcast job ' + job.id + ' started for user ' + (job.data && job.data.userId));
+});
+
 worker.on('completed', function(job) {
-  console.log('Broadcast job (' + (job.id || 'immediate') + ') completed for user ' + job.data.userId);
+  console.log('✅ Broadcast job ' + job.id + ' completed for user ' + (job.data && job.data.userId));
 });
 
 worker.on('failed', async function(job, err) {
-  console.error('Broadcast job (' + (job.id || 'immediate') + ') failed permanently: ' + err.message);
-  const { userId, broadcastId } = job.data || {};
-  if (broadcastId) {
-    await ScheduledBroadcast.findOneAndUpdate({ broadcastId: broadcastId }, { status: 'failed' }).catch(function() {});
+  // FIX: wrap entire handler in try/catch so an error inside (e.g. a failed
+  // Telegram send) does not crash the event handler and swallow the log.
+  try {
+    console.error('❌ Broadcast job ' + (job && job.id) + ' failed permanently: ' + err.message);
+    console.error('   Job data:', job && job.data);
+
+    const data = (job && job.data) || {};
+    const userId = data.userId;
+    const broadcastId = data.broadcastId;
+
+    if (!userId) {
+      console.error('   Cannot recover — no userId in job data');
+      return;
+    }
+
+    if (broadcastId) {
+      await ScheduledBroadcast.findOneAndUpdate(
+        { broadcastId: broadcastId },
+        { status: 'failed' }
+      ).catch(function(dbErr) {
+        console.error('   Failed to mark broadcast as failed in DB:', dbErr.message);
+      });
+    }
+
+    // Lazily hydrate bot for notification if needed
+    if (!activeBots.has(userId)) {
+      const userForBot = await User.findOne({ id: userId });
+      if (userForBot && userForBot.telegramBotToken) {
+        registerBot(userForBot);
+      }
+    }
+
+    const user = await User.findOne({ id: userId });
+    if (user && user.isTelegramConnected && user.telegramChatId && activeBots.has(userId)) {
+      const bot = activeBots.get(userId);
+      const text = broadcastId
+        ? '<b>Scheduled Broadcast Failed</b>\n\nFailed after all retries.\nError: ' + escapeHtml(err.message)
+        : '<b>Broadcast Failed</b>\n\nFailed after all retries.\nError: ' + escapeHtml(err.message);
+      try {
+        await bot.telegram.sendMessage(user.telegramChatId, text, { parse_mode: 'HTML' });
+      } catch (notifyErr) {
+        console.error('   Also failed to notify user via Telegram:', notifyErr.message);
+      }
+    }
+  } catch (handlerErr) {
+    console.error('❌ Error inside worker "failed" handler:', handlerErr.message);
   }
-  const user = await User.findOne({ id: userId });
-  if (user && user.isTelegramConnected && user.telegramChatId && activeBots.has(userId)) {
-    const bot = activeBots.get(userId);
-    const text = broadcastId 
-      ? '<b>Scheduled Broadcast Failed</b>\n\nFailed after retries.\nError: ' + err.message
-      : '<b>Broadcast Failed</b>\n\nFailed after retries.\nError: ' + err.message;
-    try {
-      await bot.telegram.sendMessage(user.telegramChatId, text, { parse_mode: 'HTML' });
-    } catch {}
-  }
+});
+
+worker.on('stalled', function(jobId) {
+  console.warn('⚠️ Broadcast job ' + jobId + ' stalled and will be retried');
 });
 
 // ==================== SCHEDULED BROADCAST RECOVERY AFTER RESTART ====================
@@ -800,7 +898,7 @@ async function recoverLostScheduledBroadcasts() {
   }).lean();
 
   if (pendingFuture.length === 0) {
-    console.log('✓ No pending future scheduled broadcasts need recovery');
+    console.log('✔ No pending future scheduled broadcasts need recovery');
     return;
   }
 
@@ -812,20 +910,22 @@ async function recoverLostScheduledBroadcasts() {
   for (const task of pendingFuture) {
     const jobId = task.broadcastId;
 
-    const existing = await broadcastQueue.getJob(jobId);
-    if (existing) {
-      const state = await existing.getState();
-      // Only skip if genuinely waiting/delayed/active — remove stale completed/failed jobs
-      if (state === 'waiting' || state === 'delayed' || state === 'active') {
-        alreadyExists++;
-        continue;
+    try {
+      const existing = await broadcastQueue.getJob(jobId);
+      if (existing) {
+        const state = await existing.getState();
+        // Only skip if genuinely waiting/delayed/active — remove stale completed/failed jobs
+        if (state === 'waiting' || state === 'delayed' || state === 'active') {
+          alreadyExists++;
+          console.log('  ↩ Job ' + jobId + ' already in queue with state: ' + state);
+          continue;
+        }
+        await existing.remove();
+        console.log('  🗑 Removed stale job ' + jobId + ' with state: ' + state);
       }
-      await existing.remove();
-    }
 
-    const delayMs = task.scheduledTime.getTime() - Date.now();
+      const delayMs = task.scheduledTime.getTime() - Date.now();
 
-    if (delayMs <= 1000) {
       await broadcastQueue.add(
         'send-broadcast',
         {
@@ -835,32 +935,21 @@ async function recoverLostScheduledBroadcasts() {
         },
         {
           jobId: task.broadcastId,
+          delay: delayMs > 1000 ? delayMs : 0,
           attempts: 4,
           backoff: { type: 'exponential', delay: 5000 }
         }
       );
-    } else {
-      await broadcastQueue.add(
-        'send-broadcast',
-        {
-          userId: task.userId,
-          message: task.message,
-          broadcastId: task.broadcastId
-        },
-        {
-          jobId: task.broadcastId,
-          delay: delayMs,
-          attempts: 4,
-          backoff: { type: 'exponential', delay: 5000 }
-        }
-      );
-    }
 
-    recovered++;
+      recovered++;
+      console.log('  ✅ Re-queued broadcast ' + jobId + ' with delay ' + Math.round(delayMs / 1000) + 's');
+    } catch (err) {
+      console.error('  ❌ Failed to recover broadcast ' + task.broadcastId + ': ' + err.message);
+    }
   }
 
   console.log(
-    '✓ Recovery completed: ' + recovered + ' broadcast(s) re-queued, ' +
+    '✔ Recovery completed: ' + recovered + ' broadcast(s) re-queued, ' +
     alreadyExists + ' were already present in queue'
   );
 }
@@ -957,13 +1046,13 @@ app.post('/api/auth/connect-telegram', authenticateToken, async function(req, re
         timeout: 20000
       });
       if (!response.data.ok) {
-        return res.status(400).json({ 
-          error: 'Invalid bot token – Telegram rejected it: ' + (response.data.description || 'Unauthorized') 
+        return res.status(400).json({
+          error: 'Invalid bot token — Telegram rejected it: ' + (response.data.description || 'Unauthorized')
         });
       }
       botInfo = response.data.result;
       if (!botInfo || !botInfo.username) {
-        return res.status(400).json({ error: 'Invalid response – missing bot username' });
+        return res.status(400).json({ error: 'Invalid response — missing bot username' });
       }
       break;
     } catch (err) {
@@ -971,7 +1060,7 @@ app.post('/api/auth/connect-telegram', authenticateToken, async function(req, re
       if (attempts >= maxAttempts) {
         return res.status(500).json({ error: 'Network error validating bot token. Please try again later.' });
       }
-      await new Promise(r => setTimeout(r, 8000));
+      await new Promise(function(r) { setTimeout(r, 8000); });
     }
   }
 
@@ -1031,13 +1120,13 @@ app.post('/api/auth/change-bot-token', authenticateToken, async function(req, re
         timeout: 20000
       });
       if (!response.data.ok) {
-        return res.status(400).json({ 
-          error: 'Invalid new token – Telegram rejected it: ' + (response.data.description || 'Unauthorized') 
+        return res.status(400).json({
+          error: 'Invalid new token — Telegram rejected it: ' + (response.data.description || 'Unauthorized')
         });
       }
       botInfo = response.data.result;
       if (!botInfo || !botInfo.username) {
-        return res.status(400).json({ error: 'Invalid response – missing bot username' });
+        return res.status(400).json({ error: 'Invalid response — missing bot username' });
       }
       break;
     } catch (err) {
@@ -1045,7 +1134,7 @@ app.post('/api/auth/change-bot-token', authenticateToken, async function(req, re
       if (attempts >= maxAttempts) {
         return res.status(500).json({ error: 'Network error validating new bot token. Please try again later.' });
       }
-      await new Promise(r => setTimeout(r, 8000));
+      await new Promise(function(r) { setTimeout(r, 8000); });
     }
   }
 
@@ -1126,7 +1215,7 @@ async function send2FACodeViaBot(user, code) {
   try {
     await activeBots.get(user.id).telegram.sendMessage(
       user.telegramChatId,
-      'Security Alert – Password Reset\n\nYour 6-digit code:\n\n<b>' + code + '</b>\n\nValid for 10 minutes.',
+      'Security Alert — Password Reset\n\nYour 6-digit code:\n\n<b>' + code + '</b>\n\nValid for 10 minutes.',
       { parse_mode: 'HTML' }
     );
     return true;
@@ -1256,7 +1345,7 @@ app.post('/api/subscription/webhook', async function(req, res) {
 
     if (event.event === 'charge.success') {
       const reference = event.data.reference;
-      const userId = event.data.metadata?.userId;
+      const userId = event.data.metadata && event.data.metadata.userId;
 
       if (!userId) return res.status(200).send('OK');
 
@@ -1285,7 +1374,7 @@ app.post('/api/subscription/webhook', async function(req, res) {
 });
 
 app.get('/subscription-success', function(req, res) {
-  res.send('<!DOCTYPE html>\n<html lang="en">\n<head>\n  <meta charset="UTF-8">\n  <title>Payment Successful</title>\n  <style>\n    body{font-family:system-ui,sans-serif;background:#0a0a0a;color:#00ff41;display:flex;justify-content:center;align-items:center;min-height:100vh;margin:0;}\n    .box{background:#111;padding:60px;border-radius:20px;text-align:center;box-shadow:0 0 30px rgba(0,255,65,0.2);}\n    h1{margin:0 0 20px;font-size:3em;color:#00ff41;}\n    p{font-size:1.3em;margin:20px 0;line-height:1.6;}\n    a{display:inline-block;margin-top:30px;padding:14px 32px;background:#00ff41;color:#000;font-weight:bold;text-decoration:none;border-radius:8px;font-size:1.1em;}\n    a:hover{background:#00cc33;}\n  </style>\n</head>\n<body>\n  <div class="box">\n    <h1>✓ Payment Successful!</h1>\n    <p>Your subscription is now <strong>active</strong>.</p>\n    <p>You have unlimited broadcasts, landing pages, and forms.</p>\n    <p><a href="https://sendmi.onrender.com">← Return to Dashboard</a></p>\n  </div>\n</body>\n</html>');
+  res.send('<!DOCTYPE html>\n<html lang="en">\n<head>\n  <meta charset="UTF-8">\n  <title>Payment Successful</title>\n  <style>\n    body{font-family:system-ui,sans-serif;background:#0a0a0a;color:#00ff41;display:flex;justify-content:center;align-items:center;min-height:100vh;margin:0;}\n    .box{background:#111;padding:60px;border-radius:20px;text-align:center;box-shadow:0 0 30px rgba(0,255,65,0.2);}\n    h1{margin:0 0 20px;font-size:3em;color:#00ff41;}\n    p{font-size:1.3em;margin:20px 0;line-height:1.6;}\n    a{display:inline-block;margin-top:30px;padding:14px 32px;background:#00ff41;color:#000;font-weight:bold;text-decoration:none;border-radius:8px;font-size:1.1em;}\n    a:hover{background:#00cc33;}\n  </style>\n</head>\n<body>\n  <div class="box">\n    <h1>✔ Payment Successful!</h1>\n    <p>Your subscription is now <strong>active</strong>.</p>\n    <p>You have unlimited broadcasts, landing pages, and forms.</p>\n    <p><a href="https://sendmi.onrender.com">← Return to Dashboard</a></p>\n  </div>\n</body>\n</html>');
 });
 
 // ==================== CACHED HIGH-READ ENDPOINTS ====================
@@ -1302,17 +1391,14 @@ app.get('/p/:shortId', async function(req, res) {
 
   const processedBlocks = page.config.blocks.map(function(block) {
     if (block.type === 'text') {
-      return {
-        ...block,
-        htmlContent: textToHtmlForDisplay(block.content)
-      };
+      return Object.assign({}, block, { htmlContent: textToHtmlForDisplay(block.content) });
     }
     return block;
   });
 
-  const data = { 
-    title: page.title, 
-    blocks: processedBlocks 
+  const data = {
+    title: page.title,
+    blocks: processedBlocks
   };
 
   publicCache.set(key, { data: data, timestamp: Date.now() });
@@ -1678,7 +1764,7 @@ app.post('/api/broadcast/now', authenticateToken, async function(req, res) {
     return res.status(400).json({ error: 'Message empty after processing' });
   }
 
-  await broadcastQueue.add('send-broadcast', {
+  const job = await broadcastQueue.add('send-broadcast', {
     userId: req.user.id,
     message: readyMessage
   }, {
@@ -1686,14 +1772,18 @@ app.post('/api/broadcast/now', authenticateToken, async function(req, res) {
     backoff: { type: 'exponential', delay: 5000 }
   });
 
-  res.json({ 
-    success: true, 
-    message: 'Broadcast queued and sending in background. You will receive a delivery report via Telegram shortly.' 
+  console.log('📤 Immediate broadcast queued: job ' + job.id + ' for user ' + req.user.id);
+
+  res.json({
+    success: true,
+    message: 'Broadcast queued and sending in background. You will receive a delivery report via Telegram shortly.'
   });
 });
 
 app.post('/api/broadcast/schedule', authenticateToken, async function(req, res) {
-  const { message, scheduledTime, recipients = 'all' } = req.body;
+  const { message, scheduledTime, recipients } = req.body;
+  const recipientsList = recipients || 'all';
+
   if (!message || !message.trim()) return res.status(400).json({ error: 'Message required' });
 
   const processed = message.trim();
@@ -1721,7 +1811,7 @@ app.post('/api/broadcast/schedule', authenticateToken, async function(req, res) 
     broadcastId: broadcastId,
     userId: req.user.id,
     message: readyMessage,
-    recipients: recipients,
+    recipients: recipientsList,
     scheduledTime: time,
     status: 'pending',
     createdAt: now
@@ -1737,7 +1827,7 @@ app.post('/api/broadcast/schedule', authenticateToken, async function(req, res) 
     await existingJob.remove();
   }
 
-  await broadcastQueue.add('send-broadcast', {
+  const job = await broadcastQueue.add('send-broadcast', {
     userId: req.user.id,
     message: readyMessage,
     broadcastId: broadcastId
@@ -1747,6 +1837,8 @@ app.post('/api/broadcast/schedule', authenticateToken, async function(req, res) 
     attempts: 4,
     backoff: { type: 'exponential', delay: 5000 }
   });
+
+  console.log('⏰ Scheduled broadcast queued: job ' + job.id + ' for user ' + req.user.id + ' at ' + time.toISOString() + ' (delay: ' + Math.round(delay / 1000) + 's)');
 
   res.json({ success: true, broadcastId: broadcastId, scheduledTime: time.toISOString() });
 });
@@ -1818,7 +1910,7 @@ app.patch('/api/broadcast/scheduled/:broadcastId', authenticateToken, async func
 
     const delay = task.scheduledTime.getTime() - Date.now();
 
-    await broadcastQueue.add('send-broadcast', {
+    const job = await broadcastQueue.add('send-broadcast', {
       userId: task.userId,
       message: task.message,
       broadcastId: task.broadcastId
@@ -1828,6 +1920,8 @@ app.patch('/api/broadcast/scheduled/:broadcastId', authenticateToken, async func
       attempts: 4,
       backoff: { type: 'exponential', delay: 5000 }
     });
+
+    console.log('✏️  Broadcast ' + task.broadcastId + ' updated and re-queued: job ' + job.id + ' delay ' + Math.round((delay > 0 ? delay : 0) / 1000) + 's');
   }
 
   res.json({ success: true, broadcastId: task.broadcastId, scheduledTime: task.scheduledTime.toISOString() });
