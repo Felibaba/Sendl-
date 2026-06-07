@@ -716,7 +716,7 @@ async function processBroadcast(job) {
   if (total === 0) {
     reportText += 'No subscribed contacts with Telegram connected.';
   } else {
-    const emoji = failed === 0 ? '✅' : '⚠️';
+    const emoji = failed === 0 ? '🎉' : '⚠️';
     reportText += '(' + emoji + ' <b>' + sent + ' of ' + total + '</b> delivered.\n';
     if (failed > 0) reportText += failed + ' failed.';
   }
@@ -739,7 +739,7 @@ async function processBroadcast(job) {
 
 const worker = new Worker('telegram-broadcasts', processBroadcast, {
   connection: redisConnection,
-  concurrency: 4
+  concurrency: 8
 });
 
 worker.on('completed', function(job) {
