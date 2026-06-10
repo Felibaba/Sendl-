@@ -6,7 +6,7 @@ const jwt = require('jsonwebtoken');
 const cors = require('cors');
 const { v4: uuidv4 } = require('uuid');
 const rateLimit = require('express-rate-limit');
-const { Telegraf } = require('telegraf');
+const { Telegraf, Telegram } = require('telegraf');
 const path = require('path');
 const mongoose = require('mongoose');
 const axios = require('axios');
@@ -50,9 +50,6 @@ if (PAYSTACK_SECRET_KEY.startsWith('sk_test_fallback')) {
 const MONTHLY_PRICE_KOBO = 150000; // ₦5,000 in kobo
 
 // Batching config
-// 25 messages sent in parallel per batch, then 1 second delay before next batch.
-// This keeps throughput at ~25 msg/sec — safely under Telegram's 30 msg/sec hard limit.
-// At this rate, 10,000 subscribers are reached in ~7 minutes instead of ~53 minutes.
 const BATCH_SIZE = 25;
 const BATCH_DELAY_MS = 1000;
 const MAX_MSG_LENGTH = 4000;
@@ -200,9 +197,6 @@ mongoose.connect(MONGODB_URI, {
 });
 
 // ==================== SCHEMAS & MODELS ====================
-// NOTE: All indexes must be defined on the schema BEFORE mongoose.model() is called.
-// Indexes added after model creation are silently ignored by Mongoose.
-
 const userSchema = new mongoose.Schema({
   id: { type: String, required: true, unique: true },
   fullName: String,
@@ -230,7 +224,6 @@ const landingPageSchema = new mongoose.Schema({
   updatedAt: Date,
 }, { timestamps: true });
 
-// FIX: indexes defined before mongoose.model()
 landingPageSchema.index({ userId: 1 });
 
 const formPageSchema = new mongoose.Schema({
@@ -243,7 +236,6 @@ const formPageSchema = new mongoose.Schema({
   updatedAt: Date,
 }, { timestamps: true });
 
-// FIX: indexes defined before mongoose.model()
 formPageSchema.index({ userId: 1 });
 
 const contactSchema = new mongoose.Schema({
@@ -258,7 +250,6 @@ const contactSchema = new mongoose.Schema({
   unsubscribedAt: Date,
 }, { timestamps: true });
 
-// FIX: indexes defined before mongoose.model()
 contactSchema.index({ userId: 1 });
 contactSchema.index({ userId: 1, contact: 1 });
 contactSchema.index({ userId: 1, telegramChatId: 1 });
@@ -274,7 +265,6 @@ const scheduledBroadcastSchema = new mongoose.Schema({
   createdAt: Date,
 }, { timestamps: true });
 
-// FIX: indexes defined before mongoose.model()
 scheduledBroadcastSchema.index({ userId: 1 });
 scheduledBroadcastSchema.index({ status: 1 });
 scheduledBroadcastSchema.index({ scheduledTime: 1 });
@@ -285,11 +275,6 @@ const broadcastDailySchema = new mongoose.Schema({
   count: { type: Number, default: 1 },
 }, { timestamps: true });
 
-// FIX: unique compound index defined before mongoose.model()
-// Previously this was defined AFTER the model call, causing it to be silently
-// ignored. That broke the upsert in incrementDailyBroadcast() — duplicate
-// records were created instead of incrementing, making daily limit checks
-// unreliable and scheduled broadcasts to appear to succeed but not queue.
 broadcastDailySchema.index({ userId: 1, date: 1 }, { unique: true });
 
 const adminSettingsSchema = new mongoose.Schema({
@@ -318,7 +303,6 @@ adminSettingsSchema.statics.updateSettings = async function(updates) {
   return settings;
 };
 
-// All models created after their schema indexes are fully defined
 const AdminSettings = mongoose.model('AdminSettings', adminSettingsSchema);
 const User = mongoose.model('User', userSchema);
 const LandingPage = mongoose.model('LandingPage', landingPageSchema);
@@ -334,8 +318,6 @@ const pendingSubscribers = new Map();
 
 // ==================== TELEGRAM BOT MANAGEMENT ====================
 
-// Registers bot command/event handlers and adds instance to activeBots.
-// Does NOT make any Telegram API calls — safe to call at any time.
 function registerBotHandlers(user, bot) {
   bot.webhookReply = false;
   bot.options.webhookReply = false;
@@ -433,8 +415,6 @@ function registerBotHandlers(user, bot) {
   activeBots.set(user.id, bot);
 }
 
-// Sets the Telegram webhook for a user's bot.
-// Only called when a token is first connected or changed.
 async function setupBotWebhook(user) {
   if (!user.telegramBotToken) return;
 
@@ -487,12 +467,9 @@ async function setupBotWebhook(user) {
   }
 }
 
-// Creates a bot instance with handlers registered. No API calls made here.
-// Call setupBotWebhook(user) separately when the token is first connected or changed.
 function registerBot(user) {
   if (!user.telegramBotToken) return;
 
-  // Remove any existing instance first
   if (activeBots.has(user.id)) {
     activeBots.delete(user.id);
   }
@@ -531,12 +508,10 @@ const formSubmitLimiter = rateLimit({
 });
 
 // ==================== WEBHOOK ENDPOINT ====================
-// Lazily hydrates the bot instance on first incoming update if not already loaded.
 app.post('/webhook/' + WEBHOOK_SECRET + '/:userId', async function(req, res) {
   const userId = req.params.userId;
   let bot = activeBots.get(userId);
 
-  // Lazy hydration: if no bot instance in memory, load user from DB and register handlers
   if (!bot) {
     try {
       const user = await User.findOne({ id: userId });
@@ -707,8 +682,7 @@ async function processBroadcast(job) {
 
   console.log('📤 Processing broadcast job ' + job.id + ' for user ' + userId + (broadcastId ? ' (scheduled: ' + broadcastId + ')' : ' (immediate)'));
 
-  // Lazily hydrate bot if not in memory (e.g. after a server restart
-  // where no webhook has fired yet for this user)
+  // Lazily hydrate bot for webhook handling if not in memory
   if (!activeBots.has(userId)) {
     const userForBot = await User.findOne({ id: userId });
     if (userForBot && userForBot.telegramBotToken) {
@@ -717,16 +691,19 @@ async function processBroadcast(job) {
     }
   }
 
-  const bot = activeBots.get(userId);
-  if (!bot) {
-    // Throwing here lets BullMQ retry the job up to the configured attempts limit
-    throw new Error('Telegram bot not connected for user ' + userId);
+  // Always fetch fresh user from DB — never rely on activeBots for report delivery
+  const user = await User.findOne({ id: userId });
+
+  if (!user || !user.telegramBotToken) {
+    throw new Error('Telegram bot token missing for user ' + userId);
   }
+
+  // Raw Telegram HTTP client — no webhook, no polling, no bot instance needed.
+  // Works regardless of whether activeBots has this user or not.
+  const tg = new Telegram(user.telegramBotToken);
 
   const chunks = splitTelegramMessage(message);
 
-  // .lean() returns plain JS objects instead of full Mongoose documents.
-  // For large lists (10k+ contacts) this is 3-5x faster and uses far less memory.
   const targets = await Contact.find({
     userId: userId,
     status: 'subscribed',
@@ -739,16 +716,11 @@ async function processBroadcast(job) {
 
   console.log('📋 Broadcast job ' + job.id + ': sending to ' + total + ' subscribers');
 
-  if (total === 0) {
-    console.log('ℹ️  No subscribed contacts with Telegram connected for user ' + userId);
-  }
-
   const batches = [];
   for (let i = 0; i < targets.length; i += BATCH_SIZE) {
     batches.push(targets.slice(i, i + BATCH_SIZE));
   }
 
-  // Collect blocked contact IDs in memory and bulk-write at end.
   const unsubscribedIds = [];
 
   for (let b = 0; b < batches.length; b++) {
@@ -757,73 +729,35 @@ async function processBroadcast(job) {
     await Promise.all(batch.map(async function(target) {
       try {
         for (const chunk of chunks) {
-          await bot.telegram.sendMessage(target.telegramChatId, chunk, { parse_mode: 'HTML' });
+          await tg.sendMessage(target.telegramChatId, chunk, { parse_mode: 'HTML' });
         }
         sent++;
-        console.log('  ✓ Sent to chatId ' + target.telegramChatId + ' (' + (target.name || 'unknown') + ')');
       } catch (err) {
         failed++;
-        const errCode = err.response && err.response.error_code;
-        const errDesc = (err.response && err.response.description) || err.message || 'unknown error';
-        const isBlocked = errCode === 403 ||
-          /blocked|forbidden|chat not found|deactivated/i.test(errDesc);
-
+        const isBlocked = (err.response && err.response.error_code === 403) ||
+          /blocked|forbidden|chat not found|deactivated/i.test(err.message || '');
         if (isBlocked) {
-          console.warn('  ✗ Blocked/deactivated chatId ' + target.telegramChatId + ' — will unsubscribe. Code: ' + errCode + ' | ' + errDesc);
           unsubscribedIds.push(target._id);
         } else {
-          // Log the full error so we can see exactly what Telegram is returning
-          console.error('  ✗ Send FAILED for chatId ' + target.telegramChatId + ' — Code: ' + errCode + ' | ' + errDesc);
+          console.warn('Send failed for chatId ' + target.telegramChatId + ': ' + err.message);
         }
       }
     }));
 
-    console.log('  Batch ' + (b + 1) + '/' + batches.length + ' done');
-
-    // 1 second between batches keeps throughput at ~25 msg/sec — under Telegram's 30/sec limit.
     if (b < batches.length - 1) {
       await new Promise(function(resolve) { setTimeout(resolve, BATCH_DELAY_MS); });
     }
   }
 
-  // Single bulk DB update for all blocked/deactivated contacts
+  // Bulk update blocked/deactivated contacts
   if (unsubscribedIds.length > 0) {
     await Contact.updateMany(
       { _id: { $in: unsubscribedIds } },
       { status: 'unsubscribed', unsubscribedAt: new Date(), telegramChatId: null }
     );
-    console.log('  Unsubscribed ' + unsubscribedIds.length + ' blocked/deactivated contact(s)');
   }
 
-  // ----------------------------------------------------------------
-  // FIX: Only delete the scheduled broadcast record AFTER we have
-  // finished sending. Previously it was deleted unconditionally which
-  // meant a broadcast that sent 0 messages looked identical to one
-  // that sent all of them, and the frontend showed the job as "sent"
-  // even when nothing went out.
-  // ----------------------------------------------------------------
-  if (broadcastId) {
-    await ScheduledBroadcast.deleteOne({ broadcastId: broadcastId });
-    console.log('✅ Scheduled broadcast ' + broadcastId + ' removed from DB after completing send');
-  }
-
-  invalidateUserCache(userId, 'contacts');
-
-  console.log('✅ Broadcast job ' + job.id + ' done: ' + sent + ' sent, ' + failed + ' failed out of ' + total);
-
-  // ----------------------------------------------------------------
-  // Send delivery report to the account owner via their own bot.
-  // This is done LAST — after the DB is cleaned up — so a failure
-  // here never prevents the scheduled record from being removed.
-  // We re-fetch the user here so we always have the freshest
-  // telegramChatId (it could have changed during a long broadcast).
-  // ----------------------------------------------------------------
-  const user = await User.findOne({ id: userId });
-
-  console.log('📊 Report check — isTelegramConnected: ' + (user && user.isTelegramConnected) +
-    ' | telegramChatId: ' + (user && user.telegramChatId) +
-    ' | botInMemory: ' + activeBots.has(userId));
-
+  // Build report text
   let reportText = broadcastId ? '<b>Scheduled Broadcast Report</b>\n\n' : '<b>Broadcast Report</b>\n\n';
   if (total === 0) {
     reportText += 'No subscribed contacts with Telegram connected.';
@@ -834,32 +768,32 @@ async function processBroadcast(job) {
   }
   reportText += '\n\nTime: ' + new Date().toLocaleString();
 
-  if (!user) {
-    console.error('Cannot send report — user ' + userId + ' not found in DB');
-    return;
-  }
-  if (!user.isTelegramConnected) {
-    console.warn('Cannot send report — user ' + userId + ' has isTelegramConnected=false');
-    return;
-  }
-  if (!user.telegramChatId) {
-    console.warn('Cannot send report — user ' + userId + ' has no telegramChatId (never sent /start to bot)');
-    return;
-  }
-  if (!activeBots.has(userId)) {
-    console.warn('Cannot send report — no bot instance in memory for user ' + userId);
-    return;
+  // =====================================================================
+  // FIX: Send report via raw Telegram HTTP client (tg) instead of
+  // activeBots.get(userId). The activeBots Map may be empty after a server
+  // restart or if the worker picks up a job before any webhook fires for
+  // this user. Using tg (new Telegram(token)) bypasses all in-memory state
+  // and talks directly to the Telegram REST API using the token from DB.
+  // =====================================================================
+  if (user.isTelegramConnected && user.telegramChatId) {
+    try {
+      await tg.sendMessage(user.telegramChatId, reportText, { parse_mode: 'HTML' });
+      console.log('📊 Broadcast report sent to user ' + userId);
+    } catch (err) {
+      console.error('Failed to send report to user ' + userId + ': ' + err.message);
+    }
+  } else {
+    console.warn('⚠️ Report not sent — user ' + userId + ' has no telegramChatId or is not connected');
   }
 
-  try {
-    await bot.telegram.sendMessage(user.telegramChatId, reportText, { parse_mode: 'HTML' });
-    console.log('📨 Delivery report sent to user ' + userId);
-  } catch (err) {
-    // Log full error detail — this is the most common place reports silently vanish
-    const errCode = err.response && err.response.error_code;
-    const errDesc = (err.response && err.response.description) || err.message || 'unknown';
-    console.error('❌ Failed to send delivery report to user ' + userId + ' — Code: ' + errCode + ' | ' + errDesc);
+  if (broadcastId) {
+    await ScheduledBroadcast.deleteOne({ broadcastId: broadcastId });
+    console.log('✅ Scheduled broadcast ' + broadcastId + ' completed and removed from DB');
   }
+
+  invalidateUserCache(userId, 'contacts');
+
+  console.log('✅ Broadcast job ' + job.id + ' done: ' + sent + ' sent, ' + failed + ' failed out of ' + total);
 }
 
 const worker = new Worker('telegram-broadcasts', processBroadcast, {
@@ -885,8 +819,6 @@ worker.on('completed', function(job) {
 });
 
 worker.on('failed', async function(job, err) {
-  // FIX: wrap entire handler in try/catch so an error inside (e.g. a failed
-  // Telegram send) does not crash the event handler and swallow the log.
   try {
     console.error('❌ Broadcast job ' + (job && job.id) + ' failed permanently: ' + err.message);
     console.error('   Job data:', job && job.data);
@@ -909,22 +841,15 @@ worker.on('failed', async function(job, err) {
       });
     }
 
-    // Lazily hydrate bot for notification if needed
-    if (!activeBots.has(userId)) {
-      const userForBot = await User.findOne({ id: userId });
-      if (userForBot && userForBot.telegramBotToken) {
-        registerBot(userForBot);
-      }
-    }
-
+    // FIX: fetch token from DB and use raw Telegram client for failure notification
     const user = await User.findOne({ id: userId });
-    if (user && user.isTelegramConnected && user.telegramChatId && activeBots.has(userId)) {
-      const bot = activeBots.get(userId);
+    if (user && user.isTelegramConnected && user.telegramChatId && user.telegramBotToken) {
+      const tg = new Telegram(user.telegramBotToken);
       const text = broadcastId
         ? '<b>Scheduled Broadcast Failed</b>\n\nFailed after all retries.\nError: ' + escapeHtml(err.message)
         : '<b>Broadcast Failed</b>\n\nFailed after all retries.\nError: ' + escapeHtml(err.message);
       try {
-        await bot.telegram.sendMessage(user.telegramChatId, text, { parse_mode: 'HTML' });
+        await tg.sendMessage(user.telegramChatId, text, { parse_mode: 'HTML' });
       } catch (notifyErr) {
         console.error('   Also failed to notify user via Telegram:', notifyErr.message);
       }
@@ -966,7 +891,6 @@ async function recoverLostScheduledBroadcasts() {
       const existing = await broadcastQueue.getJob(jobId);
       if (existing) {
         const state = await existing.getState();
-        // Only skip if genuinely waiting/delayed/active — remove stale completed/failed jobs
         if (state === 'waiting' || state === 'delayed' || state === 'active') {
           alreadyExists++;
           console.log('  ↩ Job ' + jobId + ' already in queue with state: ' + state);
@@ -1087,7 +1011,6 @@ app.post('/api/auth/connect-telegram', authenticateToken, async function(req, re
     return res.status(400).json({ error: 'This bot is already linked to another account.' });
   }
 
-  // Retry validation for network issues
   let botInfo;
   let attempts = 0;
   const maxAttempts = 7;
@@ -1118,7 +1041,6 @@ app.post('/api/auth/connect-telegram', authenticateToken, async function(req, re
 
   const botUsername = botInfo.username.replace(/^@/, '');
 
-  // Clear old webhook if token is different
   if (req.user.telegramBotToken && req.user.telegramBotToken !== token) {
     try {
       await axios.post('https://api.telegram.org/bot' + req.user.telegramBotToken + '/deleteWebhook', {
@@ -1136,7 +1058,6 @@ app.post('/api/auth/connect-telegram', authenticateToken, async function(req, re
   req.user.telegramChatId = null;
   await req.user.save();
 
-  // Register handlers then set the webhook (only time we call the Telegram API for webhook setup)
   registerBot(req.user);
   await setupBotWebhook(req.user);
 
@@ -1161,7 +1082,6 @@ app.post('/api/auth/change-bot-token', authenticateToken, async function(req, re
     return res.status(400).json({ error: 'This bot is already linked to another account.' });
   }
 
-  // Retry validation for network issues
   let botInfo;
   let attempts = 0;
   const maxAttempts = 7;
@@ -1192,7 +1112,6 @@ app.post('/api/auth/change-bot-token', authenticateToken, async function(req, re
 
   const botUsername = botInfo.username.replace(/^@/, '');
 
-  // Always clear old webhook on token change
   if (req.user.telegramBotToken) {
     try {
       await axios.post('https://api.telegram.org/bot' + req.user.telegramBotToken + '/deleteWebhook', {
@@ -1210,7 +1129,6 @@ app.post('/api/auth/change-bot-token', authenticateToken, async function(req, re
   req.user.telegramChatId = null;
   await req.user.save();
 
-  // Register handlers then set the webhook for the new token
   registerBot(req.user);
   await setupBotWebhook(req.user);
 
@@ -1225,7 +1143,6 @@ app.post('/api/auth/change-bot-token', authenticateToken, async function(req, re
 });
 
 app.post('/api/auth/disconnect-telegram', authenticateToken, async function(req, res) {
-  // Clear webhook via direct API
   if (req.user.telegramBotToken) {
     try {
       await axios.post('https://api.telegram.org/bot' + req.user.telegramBotToken + '/deleteWebhook', {
@@ -1237,7 +1154,6 @@ app.post('/api/auth/disconnect-telegram', authenticateToken, async function(req,
     }
   }
 
-  // Remove bot instance
   if (activeBots.has(req.user.id)) {
     activeBots.delete(req.user.id);
   }
@@ -1263,9 +1179,10 @@ function generate2FACode() {
 }
 
 async function send2FACodeViaBot(user, code) {
-  if (!user.isTelegramConnected || !user.telegramChatId || !activeBots.has(user.id)) return false;
+  if (!user.isTelegramConnected || !user.telegramChatId || !user.telegramBotToken) return false;
   try {
-    await activeBots.get(user.id).telegram.sendMessage(
+    const tg = new Telegram(user.telegramBotToken);
+    await tg.sendMessage(
       user.telegramChatId,
       'Security Alert — Password Reset\n\nYour 6-digit code:\n\n<b>' + code + '</b>\n\nValid for 10 minutes.',
       { parse_mode: 'HTML' }
@@ -1284,11 +1201,6 @@ app.post('/api/auth/forgot-password', async function(req, res) {
   const user = await User.findOne({ email: email.toLowerCase() });
   if (!user) return res.json({ success: true, message: 'If account exists, code was sent.' });
   if (!user.isTelegramConnected) return res.status(400).json({ error: 'Telegram 2FA not connected' });
-
-  // Ensure bot is loaded before trying to send a message
-  if (!activeBots.has(user.id) && user.telegramBotToken) {
-    registerBot(user);
-  }
 
   const code = generate2FACode();
   const resetToken = uuidv4();
@@ -1843,7 +1755,6 @@ app.post('/api/broadcast/schedule', authenticateToken, async function(req, res) 
     return res.status(400).json({ error: 'Message too long' });
   }
 
-  // Validate time BEFORE incrementing the daily count
   const time = new Date(scheduledTime);
   if (isNaN(time.getTime()) || time <= new Date()) {
     return res.status(400).json({ error: 'Invalid future time' });
@@ -1871,9 +1782,6 @@ app.post('/api/broadcast/schedule', authenticateToken, async function(req, res) 
 
   const delay = time.getTime() - Date.now();
 
-  // Remove any existing job with this ID before adding — BullMQ silently
-  // ignores add() if a job with the same jobId already exists, which causes
-  // broadcasts to be stored in DB but never actually sent.
   const existingJob = await broadcastQueue.getJob(broadcastId);
   if (existingJob) {
     await existingJob.remove();
@@ -2149,13 +2057,8 @@ async function loadAdminSettings() {
 
 mongoose.connection.once('open', async function() {
   await loadAdminSettings();
-
-  // No bot launching on startup — bots are lazily hydrated on first
-  // incoming webhook or when a user connects/changes their token.
   console.log('✅ Startup complete — bots will hydrate lazily on first use');
-
   await recoverLostScheduledBroadcasts();
-
   console.log('Startup sequence completed');
 });
 
@@ -2173,8 +2076,17 @@ process.on('SIGINT', async function() {
   process.exit(0);
 });
 
-app.get('/ping', function(req, res) {
-  res.status(200).type('text/plain').send('ok');
+app.get('/ping', async function(req, res) {
+  try {
+    await mongoose.connection.db.admin().ping();
+    res.status(200).json({
+      status: 'ok',
+      mongo: 'connected',
+      uptime: process.uptime()
+    });
+  } catch(err) {
+    res.status(503).json({ status: 'degraded', error: err.message });
+  }
 });
 
 app.use(function(req, res) {
