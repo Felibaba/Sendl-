@@ -736,104 +736,264 @@ function getScheduledMinute(date) {
 }
 
 // ==================== BullMQ Worker ====================
+
+// Send a single Telegram message directly via HTTP — no Telegraf dependency.
+// Retries up to maxAttempts times with exponential backoff.
+// Returns { ok: true } on success or { ok: false, blocked: bool, err: string } on final failure.
+async function sendTelegramMessage(token, chatId, text, attempt) {
+  attempt = attempt || 1;
+  const MAX_ATTEMPTS = 5;
+  const url = 'https://api.telegram.org/bot' + token + '/sendMessage';
+
+  try {
+    const response = await axios.post(url, {
+      chat_id: chatId,
+      text: text,
+      parse_mode: 'HTML'
+    }, {
+      timeout: 20000,
+      validateStatus: null // never throw on HTTP error codes — handle them below
+    });
+
+    const data = response.data;
+
+    if (data && data.ok) {
+      return { ok: true };
+    }
+
+    const errorCode = data && data.error_code;
+    const description = (data && data.description) || 'Unknown Telegram error';
+
+    // 403 = bot blocked / user deactivated — permanent, no retry
+    if (errorCode === 403 || /blocked|forbidden|deactivated|kicked/i.test(description)) {
+      return { ok: false, blocked: true, err: description };
+    }
+
+    // 400 with "chat not found" — permanent
+    if (errorCode === 400 && /chat not found/i.test(description)) {
+      return { ok: false, blocked: true, err: description };
+    }
+
+    // 429 = flood control — respect retry_after
+    if (errorCode === 429) {
+      const retryAfter = (data.parameters && data.parameters.retry_after) || 30;
+      if (attempt < MAX_ATTEMPTS) {
+        console.warn('Telegram flood control for chatId ' + chatId + ' — waiting ' + (retryAfter + 2) + 's (attempt ' + attempt + ')');
+        await new Promise(function(r) { setTimeout(r, (retryAfter + 2) * 1000); });
+        return sendTelegramMessage(token, chatId, text, attempt + 1);
+      }
+      return { ok: false, blocked: false, err: 'Flood control — max retries exceeded: ' + description };
+    }
+
+    // 5xx or other transient — retry with backoff
+    if (attempt < MAX_ATTEMPTS) {
+      const delay = Math.min(1000 * Math.pow(2, attempt - 1), 30000);
+      await new Promise(function(r) { setTimeout(r, delay); });
+      return sendTelegramMessage(token, chatId, text, attempt + 1);
+    }
+
+    return { ok: false, blocked: false, err: 'Telegram API error ' + errorCode + ': ' + description };
+
+  } catch (err) {
+    // Network error (timeout, DNS, etc.)
+    if (attempt < MAX_ATTEMPTS) {
+      const delay = Math.min(1000 * Math.pow(2, attempt - 1), 30000);
+      console.warn('Network error sending to chatId ' + chatId + ' (attempt ' + attempt + '): ' + err.message + ' — retrying in ' + (delay / 1000) + 's');
+      await new Promise(function(r) { setTimeout(r, delay); });
+      return sendTelegramMessage(token, chatId, text, attempt + 1);
+    }
+    return { ok: false, blocked: false, err: 'Network error after ' + MAX_ATTEMPTS + ' attempts: ' + err.message };
+  }
+}
+
+// Send a delivery report to the bot owner via direct HTTP.
+// Never throws — report failure is non-critical.
+async function sendDeliveryReport(token, ownerChatId, reportText) {
+  if (!token || !ownerChatId) return;
+  try {
+    await axios.post('https://api.telegram.org/bot' + token + '/sendMessage', {
+      chat_id: ownerChatId,
+      text: reportText,
+      parse_mode: 'HTML'
+    }, { timeout: 15000, validateStatus: null });
+  } catch (err) {
+    console.warn('Could not send delivery report to owner chatId ' + ownerChatId + ': ' + err.message);
+  }
+}
+
 async function processBroadcast(job) {
   const { userId, message, broadcastId } = job.data;
 
   console.log('📤 Processing broadcast job ' + job.id + ' for user ' + userId + (broadcastId ? ' (scheduled: ' + broadcastId + ')' : ' (immediate)'));
 
+  // --- Step 1: Load user and bot token directly from DB every time.
+  // Never rely on the activeBots in-memory map for the token — it may be stale
+  // after a restart, re-deploy, or token change. We use the token from DB as
+  // the source of truth for all Telegram API calls.
+  let user;
+  try {
+    user = await User.findOne({ id: userId });
+  } catch (err) {
+    // DB read failure — throw so BullMQ retries the job
+    throw new Error('DB error loading user ' + userId + ': ' + err.message);
+  }
+
+  if (!user) {
+    // User deleted — nothing to do, don't retry
+    console.error('User ' + userId + ' not found — skipping broadcast job ' + job.id);
+    if (broadcastId) {
+      await ScheduledBroadcast.deleteOne({ broadcastId: broadcastId }).catch(function() {});
+    }
+    return; // Returning (not throwing) marks job complete so BullMQ doesn't retry
+  }
+
+  const token = user.telegramBotToken;
+  if (!token) {
+    console.error('User ' + userId + ' has no bot token — skipping broadcast job ' + job.id);
+    if (broadcastId) {
+      await ScheduledBroadcast.findOneAndUpdate({ broadcastId: broadcastId }, { status: 'failed' }).catch(function() {});
+    }
+    return; // Not retryable — user has no bot
+  }
+
+  // --- Step 2: Also hydrate activeBots so webhook handling keeps working
   if (!activeBots.has(userId)) {
-    const userForBot = await User.findOne({ id: userId });
-    if (userForBot && userForBot.telegramBotToken) {
-      registerBot(userForBot);
-      console.log('Lazily hydrated bot for user ' + userId + ' inside broadcast worker');
+    try {
+      registerBot(user);
+    } catch (err) {
+      // Non-critical — webhook handling is separate from sending
+      console.warn('Could not hydrate activeBots for ' + userId + ': ' + err.message);
     }
   }
 
-  const bot = activeBots.get(userId);
-  if (!bot) {
-    throw new Error('Telegram bot not connected for user ' + userId);
+  // --- Step 3: Split message into Telegram-safe chunks
+  const chunks = splitTelegramMessage(message);
+  if (!chunks || chunks.length === 0) {
+    console.error('Message for job ' + job.id + ' produced no chunks after split — skipping');
+    if (broadcastId) {
+      await ScheduledBroadcast.deleteOne({ broadcastId: broadcastId }).catch(function() {});
+    }
+    return;
   }
 
-  const chunks = splitTelegramMessage(message);
-
-  const targets = await Contact.find({
-    userId: userId,
-    status: 'subscribed',
-    telegramChatId: { $exists: true, $ne: null }
-  }).lean();
+  // --- Step 4: Load subscribers — retry DB read up to 3 times
+  let targets = [];
+  for (let dbAttempt = 1; dbAttempt <= 3; dbAttempt++) {
+    try {
+      targets = await Contact.find({
+        userId: userId,
+        status: 'subscribed',
+        telegramChatId: { $exists: true, $ne: null, $type: 'string' }
+      }).lean();
+      break;
+    } catch (err) {
+      if (dbAttempt === 3) {
+        throw new Error('DB error loading contacts after 3 attempts for user ' + userId + ': ' + err.message);
+      }
+      console.warn('DB read for contacts failed (attempt ' + dbAttempt + '), retrying: ' + err.message);
+      await new Promise(function(r) { setTimeout(r, 2000 * dbAttempt); });
+    }
+  }
 
   const total = targets.length;
   let sent = 0;
   let failed = 0;
+  const unsubscribedIds = [];
 
   console.log('📋 Broadcast job ' + job.id + ': sending to ' + total + ' subscribers');
 
-  const batches = [];
-  for (let i = 0; i < targets.length; i += BATCH_SIZE) {
-    batches.push(targets.slice(i, i + BATCH_SIZE));
-  }
+  if (total === 0) {
+    console.log('No subscribers for job ' + job.id + ' — marking complete');
+  } else {
+    // --- Step 5: Send in batches with per-message retry built into sendTelegramMessage
+    const batches = [];
+    for (let i = 0; i < targets.length; i += BATCH_SIZE) {
+      batches.push(targets.slice(i, i + BATCH_SIZE));
+    }
 
-  const unsubscribedIds = [];
+    for (let b = 0; b < batches.length; b++) {
+      const batch = batches[b];
 
-  for (let b = 0; b < batches.length; b++) {
-    const batch = batches[b];
-
-    await Promise.all(batch.map(async function(target) {
-      try {
-        for (const chunk of chunks) {
-          await bot.telegram.sendMessage(target.telegramChatId, chunk, { parse_mode: 'HTML' });
+      await Promise.all(batch.map(async function(target) {
+        // Send all chunks for this subscriber; stop on permanent failure
+        for (let ci = 0; ci < chunks.length; ci++) {
+          const result = await sendTelegramMessage(token, target.telegramChatId, chunks[ci]);
+          if (!result.ok) {
+            failed++;
+            if (result.blocked) {
+              unsubscribedIds.push(target._id);
+              console.log('Unsubscribed blocked/deactivated chatId ' + target.telegramChatId);
+            } else {
+              console.warn('Send failed for chatId ' + target.telegramChatId + ': ' + result.err);
+            }
+            return; // Stop sending further chunks to this subscriber
+          }
         }
         sent++;
-      } catch (err) {
-        failed++;
-        const isBlocked = (err.response && err.response.error_code === 403) ||
-          /blocked|forbidden|chat not found|deactivated/i.test(err.message || '');
-        if (isBlocked) {
-          unsubscribedIds.push(target._id);
-        } else {
-          console.warn('Send failed for chatId ' + target.telegramChatId + ': ' + err.message);
-        }
-      }
-    }));
+      }));
 
-    if (b < batches.length - 1) {
-      await new Promise(function(resolve) { setTimeout(resolve, BATCH_DELAY_MS); });
+      // Inter-batch delay keeps throughput under Telegram's 30 msg/sec global limit
+      if (b < batches.length - 1) {
+        await new Promise(function(resolve) { setTimeout(resolve, BATCH_DELAY_MS); });
+      }
     }
   }
 
+  // --- Step 6: Bulk-unsubscribe blocked contacts — retry up to 3 times
   if (unsubscribedIds.length > 0) {
-    await Contact.updateMany(
-      { _id: { $in: unsubscribedIds } },
-      { status: 'unsubscribed', unsubscribedAt: new Date(), telegramChatId: null }
-    );
+    for (let dbAttempt = 1; dbAttempt <= 3; dbAttempt++) {
+      try {
+        await Contact.updateMany(
+          { _id: { $in: unsubscribedIds } },
+          { $set: { status: 'unsubscribed', unsubscribedAt: new Date(), telegramChatId: null } }
+        );
+        break;
+      } catch (err) {
+        if (dbAttempt === 3) {
+          console.error('Failed to unsubscribe blocked contacts after 3 attempts: ' + err.message);
+        } else {
+          await new Promise(function(r) { setTimeout(r, 2000 * dbAttempt); });
+        }
+      }
+    }
+    invalidateUserCache(userId, 'contacts');
   }
 
-  const user = await User.findOne({ id: userId });
+  // --- Step 7: Send delivery report to bot owner via direct HTTP
+  const emoji = total === 0 ? 'ℹ️' : (failed === 0 ? '🎉' : '⚠️');
   let reportText = broadcastId ? '<b>Scheduled Broadcast Report</b>\n\n' : '<b>Broadcast Report</b>\n\n';
   if (total === 0) {
-    reportText += 'No subscribed contacts with Telegram connected.';
+    reportText += 'ℹ️ No subscribed contacts with Telegram connected.';
   } else {
-    const emoji = failed === 0 ? '🎉' : '⚠️';
     reportText += emoji + ' <b>' + sent + ' of ' + total + '</b> delivered.';
-    if (failed > 0) reportText += '\n' + failed + ' failed (blocked/deactivated accounts removed).';
+    if (failed > 0) {
+      reportText += '\n' + failed + ' failed (blocked/deactivated — auto-removed).';
+    }
   }
   reportText += '\n\nTime: ' + new Date().toLocaleString();
 
-  if (user && user.isTelegramConnected && user.telegramChatId && activeBots.has(userId)) {
-    try {
-      await bot.telegram.sendMessage(user.telegramChatId, reportText, { parse_mode: 'HTML' });
-    } catch (err) {
-      console.error('Failed to send report to user ' + userId + ':', err.message);
+  if (user.isTelegramConnected && user.telegramChatId) {
+    await sendDeliveryReport(token, user.telegramChatId, reportText);
+  }
+
+  // --- Step 8: Clean up scheduled broadcast record
+  if (broadcastId) {
+    for (let dbAttempt = 1; dbAttempt <= 3; dbAttempt++) {
+      try {
+        await ScheduledBroadcast.deleteOne({ broadcastId: broadcastId });
+        console.log('✅ Scheduled broadcast ' + broadcastId + ' completed and removed from DB');
+        break;
+      } catch (err) {
+        if (dbAttempt === 3) {
+          console.error('Failed to remove scheduled broadcast record ' + broadcastId + ' after 3 attempts: ' + err.message);
+        } else {
+          await new Promise(function(r) { setTimeout(r, 1000 * dbAttempt); });
+        }
+      }
     }
   }
 
-  if (broadcastId) {
-    await ScheduledBroadcast.deleteOne({ broadcastId: broadcastId });
-    console.log('✅ Scheduled broadcast ' + broadcastId + ' completed and removed from DB');
-  }
-
   invalidateUserCache(userId, 'contacts');
-
   console.log('✅ Broadcast job ' + job.id + ' done: ' + sent + ' sent, ' + failed + ' failed out of ' + total);
 }
 
@@ -882,24 +1042,13 @@ worker.on('failed', async function(job, err) {
       });
     }
 
-    if (!activeBots.has(userId)) {
-      const userForBot = await User.findOne({ id: userId });
-      if (userForBot && userForBot.telegramBotToken) {
-        registerBot(userForBot);
-      }
-    }
-
-    const user = await User.findOne({ id: userId });
-    if (user && user.isTelegramConnected && user.telegramChatId && activeBots.has(userId)) {
-      const bot = activeBots.get(userId);
+    // Use direct HTTP for the failure notification — no Telegraf dependency
+    const user = await User.findOne({ id: userId }).catch(function() { return null; });
+    if (user && user.isTelegramConnected && user.telegramChatId && user.telegramBotToken) {
       const text = broadcastId
         ? '<b>Scheduled Broadcast Failed</b>\n\nFailed after all retries.\nError: ' + escapeHtml(err.message)
         : '<b>Broadcast Failed</b>\n\nFailed after all retries.\nError: ' + escapeHtml(err.message);
-      try {
-        await bot.telegram.sendMessage(user.telegramChatId, text, { parse_mode: 'HTML' });
-      } catch (notifyErr) {
-        console.error('   Also failed to notify user via Telegram:', notifyErr.message);
-      }
+      await sendDeliveryReport(user.telegramBotToken, user.telegramChatId, text);
     }
   } catch (handlerErr) {
     console.error('❌ Error inside worker "failed" handler:', handlerErr.message);
