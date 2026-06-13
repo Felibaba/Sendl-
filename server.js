@@ -258,13 +258,18 @@ contactSchema.index({ userId: 1, status: 1 });
 const scheduledBroadcastSchema = new mongoose.Schema({
   broadcastId: { type: String, required: true, unique: true },
   userId: { type: String, required: true },
-  // FIX: track the current BullMQ jobId separately from broadcastId — the
-  // jobId changes on each edit (we append _vN) so we need to store it to be
-  // able to remove the right job on cancel/edit.
+  // Tracks the current BullMQ jobId separately from broadcastId — the jobId
+  // changes on each edit (we append _vN) so we need to store it to be able
+  // to remove the right job on cancel/edit.
   currentJobId: { type: String },
   message: String,
   recipients: { type: String, default: 'all' },
   scheduledTime: Date,
+  // scheduledMinute stores the time truncated to the minute as a UTC string
+  // ("YYYY-MM-DDTHH:MM") and is used with a unique compound index on
+  // { userId, scheduledMinute } to enforce the one-broadcast-per-minute rule
+  // at the database level — concurrent requests cannot both succeed.
+  scheduledMinute: { type: String, required: true },
   status: { type: String, default: 'pending' },
   createdAt: Date,
 }, { timestamps: true });
@@ -272,6 +277,14 @@ const scheduledBroadcastSchema = new mongoose.Schema({
 scheduledBroadcastSchema.index({ userId: 1 });
 scheduledBroadcastSchema.index({ status: 1 });
 scheduledBroadcastSchema.index({ scheduledTime: 1 });
+// Unique compound index: one broadcast per user per minute.
+// MongoDB enforces this atomically so even concurrent requests can't both win.
+scheduledBroadcastSchema.index({ userId: 1, scheduledMinute: 1 }, {
+  unique: true,
+  // Only enforce uniqueness for pending broadcasts — completed/failed records
+  // use status:'failed'|'completed' and should not block future scheduling.
+  partialFilterExpression: { status: 'pending' }
+});
 
 const broadcastDailySchema = new mongoose.Schema({
   userId: { type: String, required: true },
@@ -716,6 +729,12 @@ async function getDailyBroadcastCount(userId) {
   }
 }
 
+// Returns a UTC "YYYY-MM-DDTHH:MM" string for a Date — used as the per-minute
+// collision key stored on ScheduledBroadcast.scheduledMinute.
+function getScheduledMinute(date) {
+  return date.toISOString().slice(0, 16); // e.g. "2026-06-13T14:30"
+}
+
 // ==================== BullMQ Worker ====================
 async function processBroadcast(job) {
   const { userId, message, broadcastId } = job.data;
@@ -913,11 +932,17 @@ async function recoverLostScheduledBroadcasts() {
   let alreadyExists = 0;
 
   for (const task of pendingFuture) {
-    // FIX: use currentJobId stored on the task if available, otherwise fall
-    // back to broadcastId for tasks created before this field existed.
     const jobId = task.currentJobId || task.broadcastId;
 
     try {
+      // Backfill scheduledMinute on records created before the field existed
+      if (!task.scheduledMinute) {
+        await ScheduledBroadcast.updateOne(
+          { broadcastId: task.broadcastId },
+          { scheduledMinute: getScheduledMinute(new Date(task.scheduledTime)) }
+        );
+      }
+
       const existing = await broadcastQueue.getJob(jobId);
       if (existing) {
         const state = await existing.getState();
@@ -930,20 +955,12 @@ async function recoverLostScheduledBroadcasts() {
         console.log('  🗑 Removed stale job ' + jobId + ' with state: ' + state);
       }
 
-      const delayMs = task.scheduledTime.getTime() - Date.now();
-
-      // FIX: generate a fresh jobId with timestamp suffix so BullMQ doesn't
-      // silently no-op the add() due to a stale completed/failed record for
-      // the same jobId still sitting in Redis.
+      const delayMs = new Date(task.scheduledTime).getTime() - Date.now();
       const newJobId = task.broadcastId + '_v' + Date.now();
 
       const addedJob = await broadcastQueue.add(
         'send-broadcast',
-        {
-          userId: task.userId,
-          message: task.message,
-          broadcastId: task.broadcastId
-        },
+        { userId: task.userId, message: task.message, broadcastId: task.broadcastId },
         {
           jobId: newJobId,
           delay: delayMs > 1000 ? delayMs : 0,
@@ -952,7 +969,6 @@ async function recoverLostScheduledBroadcasts() {
         }
       );
 
-      // Persist the new jobId so we can find and remove it on cancel/edit.
       await ScheduledBroadcast.updateOne(
         { broadcastId: task.broadcastId },
         { currentJobId: addedJob.id }
@@ -1754,153 +1770,231 @@ app.post('/api/contacts/delete', authenticateToken, async function(req, res) {
 });
 
 // ==================== BROADCASTING ====================
-app.post('/api/broadcast/now', authenticateToken, async function(req, res) {
-  const { message } = req.body;
-  if (!message || !message.trim()) return res.status(400).json({ error: 'Message required' });
 
-  const processed = message.trim();
-  if (processed.length > MAX_MSG_LENGTH * 10) {
-    return res.status(400).json({ error: 'Message too long' });
+// Helper: safely remove a BullMQ job by ID without throwing if it's gone.
+async function safeRemoveJob(jobId) {
+  if (!jobId) return;
+  try {
+    const job = await broadcastQueue.getJob(jobId);
+    if (job) await job.remove();
+  } catch (err) {
+    console.warn('safeRemoveJob: could not remove job ' + jobId + ': ' + err.message);
   }
+}
 
-  // FIX: check the limit BEFORE incrementing so a rejected request doesn't
-  // burn one of the user's daily slots.
-  const limits = getUserLimits(req.user);
-  if (limits.dailyBroadcasts !== Infinity) {
-    const currentCount = await getDailyBroadcastCount(req.user.id);
-    if (currentCount >= limits.dailyBroadcasts) {
+// Helper: add a job to the broadcast queue with full error handling.
+// Returns the created job or throws with a clean message.
+async function safeAddBroadcastJob(payload, opts) {
+  try {
+    return await broadcastQueue.add('send-broadcast', payload, opts);
+  } catch (err) {
+    console.error('safeAddBroadcastJob failed:', err.message);
+    throw err;
+  }
+}
+
+app.post('/api/broadcast/now', authenticateToken, async function(req, res) {
+  try {
+    const { message } = req.body;
+    if (!message || !message.trim()) {
+      return res.status(400).json({ error: 'Message required' });
+    }
+
+    const processed = message.trim();
+    if (processed.length > MAX_MSG_LENGTH * 10) {
+      return res.status(400).json({ error: 'Message too long' });
+    }
+
+    // Pre-check limit before incrementing so rejected requests don't burn slots
+    const limits = getUserLimits(req.user);
+    if (limits.dailyBroadcasts !== Infinity) {
+      let currentCount = 0;
+      try {
+        currentCount = await getDailyBroadcastCount(req.user.id);
+      } catch (err) {
+        console.error('getDailyBroadcastCount failed for ' + req.user.id + ':', err.message);
+        return res.status(500).json({ error: 'Could not verify broadcast limit. Please try again.' });
+      }
+      if (currentCount >= limits.dailyBroadcasts) {
+        return res.status(403).json({ error: 'Daily broadcast limit reached.' });
+      }
+    }
+
+    // Increment — handles E11000 race conditions internally
+    let todayCount;
+    try {
+      todayCount = await incrementDailyBroadcast(req.user.id);
+    } catch (err) {
+      console.error('incrementDailyBroadcast failed for ' + req.user.id + ':', err.message);
+      return res.status(500).json({ error: 'Could not record broadcast count. Please try again.' });
+    }
+
+    // Double-check for concurrent requests that slipped past the pre-check
+    if (limits.dailyBroadcasts !== Infinity && todayCount > limits.dailyBroadcasts) {
       return res.status(403).json({ error: 'Daily broadcast limit reached.' });
     }
-  }
 
-  // FIX: wrap increment in try/catch so a DB error returns a clear 500
-  // instead of an unhandled rejection that crashes the route silently.
-  let todayCount;
-  try {
-    todayCount = await incrementDailyBroadcast(req.user.id);
-  } catch (err) {
-    console.error('Failed to increment daily broadcast count for ' + req.user.id + ':', err.message);
-    return res.status(500).json({ error: 'Internal error — please try again.' });
-  }
+    const readyMessage = prepareTelegramMessage(processed);
+    if (!readyMessage || readyMessage.length === 0) {
+      return res.status(400).json({ error: 'Message is empty after processing.' });
+    }
 
-  // Double-check in case two concurrent requests slipped through the pre-check
-  if (todayCount > limits.dailyBroadcasts && limits.dailyBroadcasts !== Infinity) {
-    return res.status(403).json({ error: 'Daily broadcast limit reached.' });
-  }
+    let job;
+    try {
+      job = await safeAddBroadcastJob(
+        { userId: req.user.id, message: readyMessage },
+        { attempts: 4, backoff: { type: 'exponential', delay: 5000 } }
+      );
+    } catch (err) {
+      console.error('Failed to queue immediate broadcast for ' + req.user.id + ':', err.message);
+      return res.status(500).json({ error: 'Failed to queue broadcast. Please try again in a moment.' });
+    }
 
-  const readyMessage = prepareTelegramMessage(processed);
-
-  if (readyMessage.length === 0) {
-    return res.status(400).json({ error: 'Message empty after processing' });
-  }
-
-  // FIX: wrap queue.add in try/catch — if Redis is down the job add throws
-  // and we should return an error rather than hanging or crashing.
-  let job;
-  try {
-    job = await broadcastQueue.add('send-broadcast', {
-      userId: req.user.id,
-      message: readyMessage
-    }, {
-      attempts: 4,
-      backoff: { type: 'exponential', delay: 5000 }
+    console.log('📤 Immediate broadcast queued: job ' + job.id + ' for user ' + req.user.id);
+    return res.json({
+      success: true,
+      message: 'Broadcast queued and sending in background. You will receive a delivery report via Telegram shortly.'
     });
+
   } catch (err) {
-    console.error('Failed to queue immediate broadcast for ' + req.user.id + ':', err.message);
-    return res.status(500).json({ error: 'Failed to queue broadcast. Please try again.' });
+    console.error('Unhandled error in /api/broadcast/now for ' + (req.user && req.user.id) + ':', err.message);
+    return res.status(500).json({ error: 'An unexpected error occurred. Please try again.' });
   }
-
-  console.log('📤 Immediate broadcast queued: job ' + job.id + ' for user ' + req.user.id);
-
-  res.json({
-    success: true,
-    message: 'Broadcast queued and sending in background. You will receive a delivery report via Telegram shortly.'
-  });
 });
 
 app.post('/api/broadcast/schedule', authenticateToken, async function(req, res) {
-  const { message, scheduledTime, recipients } = req.body;
-  const recipientsList = recipients || 'all';
+  try {
+    const { message, scheduledTime, recipients } = req.body;
+    const recipientsList = recipients || 'all';
 
-  if (!message || !message.trim()) return res.status(400).json({ error: 'Message required' });
+    if (!message || !message.trim()) {
+      return res.status(400).json({ error: 'Message required' });
+    }
 
-  const processed = message.trim();
-  if (processed.length > MAX_MSG_LENGTH * 10) {
-    return res.status(400).json({ error: 'Message too long' });
-  }
+    const processed = message.trim();
+    if (processed.length > MAX_MSG_LENGTH * 10) {
+      return res.status(400).json({ error: 'Message too long' });
+    }
 
-  // Validate time BEFORE touching daily counts
-  const time = new Date(scheduledTime);
-  if (isNaN(time.getTime()) || time <= new Date()) {
-    return res.status(400).json({ error: 'Invalid future time' });
-  }
+    // Validate and normalise time — truncate to the minute for uniqueness check
+    if (!scheduledTime) {
+      return res.status(400).json({ error: 'scheduledTime is required' });
+    }
+    const time = new Date(scheduledTime);
+    if (isNaN(time.getTime())) {
+      return res.status(400).json({ error: 'Invalid scheduledTime format' });
+    }
+    // Truncate seconds/ms so the stored time aligns exactly with scheduledMinute
+    time.setSeconds(0, 0);
+    if (time <= new Date()) {
+      return res.status(400).json({ error: 'Scheduled time must be in the future' });
+    }
 
-  // FIX: check limit BEFORE incrementing so invalid requests don't burn slots
-  const limits = getUserLimits(req.user);
-  if (limits.dailyBroadcasts !== Infinity) {
-    const currentCount = await getDailyBroadcastCount(req.user.id);
-    if (currentCount >= limits.dailyBroadcasts) {
+    const minute = getScheduledMinute(time);
+
+    // Check for an existing pending broadcast in the same minute for this user.
+    // This is the application-level guard; the DB unique index is the hard guarantee.
+    let existingAtMinute;
+    try {
+      existingAtMinute = await ScheduledBroadcast.findOne({
+        userId: req.user.id,
+        scheduledMinute: minute,
+        status: 'pending'
+      });
+    } catch (err) {
+      console.error('Minute-collision check failed for ' + req.user.id + ':', err.message);
+      return res.status(500).json({ error: 'Could not verify schedule slot. Please try again.' });
+    }
+
+    if (existingAtMinute) {
+      return res.status(409).json({
+        error: 'You already have a broadcast scheduled at ' + minute.replace('T', ' ') + ' UTC. Please choose a different minute.'
+      });
+    }
+
+    // Pre-check daily limit before incrementing
+    const limits = getUserLimits(req.user);
+    if (limits.dailyBroadcasts !== Infinity) {
+      let currentCount = 0;
+      try {
+        currentCount = await getDailyBroadcastCount(req.user.id);
+      } catch (err) {
+        console.error('getDailyBroadcastCount failed for ' + req.user.id + ':', err.message);
+        return res.status(500).json({ error: 'Could not verify broadcast limit. Please try again.' });
+      }
+      if (currentCount >= limits.dailyBroadcasts) {
+        return res.status(403).json({ error: 'Daily broadcast limit reached.' });
+      }
+    }
+
+    let todayCount;
+    try {
+      todayCount = await incrementDailyBroadcast(req.user.id);
+    } catch (err) {
+      console.error('incrementDailyBroadcast failed for ' + req.user.id + ':', err.message);
+      return res.status(500).json({ error: 'Could not record broadcast count. Please try again.' });
+    }
+
+    if (limits.dailyBroadcasts !== Infinity && todayCount > limits.dailyBroadcasts) {
       return res.status(403).json({ error: 'Daily broadcast limit reached.' });
     }
-  }
 
-  // FIX: wrap increment in try/catch
-  let todayCount;
-  try {
-    todayCount = await incrementDailyBroadcast(req.user.id);
+    const readyMessage = prepareTelegramMessage(processed);
+    if (!readyMessage || readyMessage.length === 0) {
+      return res.status(400).json({ error: 'Message is empty after processing.' });
+    }
+
+    const broadcastId = uuidv4();
+    const jobId = broadcastId + '_v1';
+    const delay = time.getTime() - Date.now();
+
+    // Save to DB first — if queue add fails, recovery on restart re-queues it.
+    // The unique index on { userId, scheduledMinute } catches any race that
+    // slipped past the application-level check above.
+    try {
+      await ScheduledBroadcast.create({
+        broadcastId: broadcastId,
+        currentJobId: jobId,
+        userId: req.user.id,
+        message: readyMessage,
+        recipients: recipientsList,
+        scheduledTime: time,
+        scheduledMinute: minute,
+        status: 'pending',
+        createdAt: new Date()
+      });
+    } catch (err) {
+      // E11000 = unique index violation — another request beat us to this minute
+      if (err.code === 11000) {
+        return res.status(409).json({
+          error: 'You already have a broadcast scheduled at ' + minute.replace('T', ' ') + ' UTC. Please choose a different minute.'
+        });
+      }
+      console.error('Failed to save scheduled broadcast to DB for ' + req.user.id + ':', err.message);
+      return res.status(500).json({ error: 'Failed to save broadcast. Please try again.' });
+    }
+
+    let job;
+    try {
+      job = await safeAddBroadcastJob(
+        { userId: req.user.id, message: readyMessage, broadcastId: broadcastId },
+        { jobId: jobId, delay: delay, attempts: 4, backoff: { type: 'exponential', delay: 5000 } }
+      );
+    } catch (err) {
+      console.error('Failed to queue scheduled broadcast ' + broadcastId + ' for ' + req.user.id + ':', err.message);
+      // DB record is intact — recovery on restart will re-queue it
+      return res.status(500).json({
+        error: 'Broadcast saved but could not be queued right now. It will send automatically at the scheduled time after a server restart, or you can delete and reschedule.'
+      });
+    }
+
+    console.log('⏰ Scheduled broadcast queued: job ' + job.id + ' for user ' + req.user.id + ' at ' + time.toISOString() + ' (delay: ' + Math.round(delay / 1000) + 's)');
+    return res.json({ success: true, broadcastId: broadcastId, scheduledTime: time.toISOString() });
+
   } catch (err) {
-    console.error('Failed to increment daily broadcast count for ' + req.user.id + ':', err.message);
-    return res.status(500).json({ error: 'Internal error — please try again.' });
+    console.error('Unhandled error in /api/broadcast/schedule for ' + (req.user && req.user.id) + ':', err.message);
+    return res.status(500).json({ error: 'An unexpected error occurred. Please try again.' });
   }
-
-  if (todayCount > limits.dailyBroadcasts && limits.dailyBroadcasts !== Infinity) {
-    return res.status(403).json({ error: 'Daily broadcast limit reached.' });
-  }
-
-  const readyMessage = prepareTelegramMessage(processed);
-  const broadcastId = uuidv4();
-  const now = new Date();
-  const delay = time.getTime() - Date.now();
-
-  // FIX: use a versioned jobId so BullMQ never silently ignores the add()
-  // due to a stale completed/failed record with the same ID still in Redis.
-  const jobId = broadcastId + '_v1';
-
-  // Save to DB first so we have a record even if the queue add fails
-  await ScheduledBroadcast.create({
-    broadcastId: broadcastId,
-    currentJobId: jobId,
-    userId: req.user.id,
-    message: readyMessage,
-    recipients: recipientsList,
-    scheduledTime: time,
-    status: 'pending',
-    createdAt: now
-  });
-
-  // FIX: wrap queue.add in try/catch — if Redis is down we still have the DB
-  // record and recovery on restart will re-queue it.
-  let job;
-  try {
-    job = await broadcastQueue.add('send-broadcast', {
-      userId: req.user.id,
-      message: readyMessage,
-      broadcastId: broadcastId
-    }, {
-      jobId: jobId,
-      delay: delay,
-      attempts: 4,
-      backoff: { type: 'exponential', delay: 5000 }
-    });
-  } catch (err) {
-    console.error('Failed to queue scheduled broadcast ' + broadcastId + ' for ' + req.user.id + ':', err.message);
-    // Don't delete the DB record — recovery on restart will re-queue it
-    return res.status(500).json({ error: 'Broadcast saved but failed to queue. It will be retried on next server restart.' });
-  }
-
-  console.log('⏰ Scheduled broadcast queued: job ' + job.id + ' for user ' + req.user.id + ' at ' + time.toISOString() + ' (delay: ' + Math.round(delay / 1000) + 's)');
-
-  res.json({ success: true, broadcastId: broadcastId, scheduledTime: time.toISOString() });
 });
 
 app.get('/api/broadcast/scheduled', authenticateToken, async function(req, res) {
@@ -1918,98 +2012,179 @@ app.get('/api/broadcast/scheduled', authenticateToken, async function(req, res) 
 });
 
 app.delete('/api/broadcast/scheduled/:broadcastId', authenticateToken, async function(req, res) {
-  const broadcastId = req.params.broadcastId;
-  const task = await ScheduledBroadcast.findOne({ broadcastId: broadcastId, userId: req.user.id });
-  if (!task) return res.status(404).json({ error: 'Not found' });
-
-  // FIX: use currentJobId (the versioned ID) to find and remove the actual
-  // queued job. Falling back to broadcastId handles old records created before
-  // the currentJobId field was added.
-  const jobIdToRemove = task.currentJobId || broadcastId;
   try {
-    const job = await broadcastQueue.getJob(jobIdToRemove);
-    if (job) {
-      await job.remove();
+    const broadcastId = req.params.broadcastId;
+
+    let task;
+    try {
+      task = await ScheduledBroadcast.findOne({ broadcastId: broadcastId, userId: req.user.id });
+    } catch (err) {
+      console.error('DB lookup failed in DELETE /scheduled/' + broadcastId + ':', err.message);
+      return res.status(500).json({ error: 'Database error. Please try again.' });
     }
+
+    if (!task) return res.status(404).json({ error: 'Broadcast not found.' });
+
+    // Remove from queue — safe even if job is already gone
+    await safeRemoveJob(task.currentJobId || broadcastId);
+
+    try {
+      await task.deleteOne();
+    } catch (err) {
+      console.error('Failed to delete scheduled broadcast ' + broadcastId + ' from DB:', err.message);
+      return res.status(500).json({ error: 'Failed to delete broadcast. Please try again.' });
+    }
+
+    return res.json({ success: true });
+
   } catch (err) {
-    console.warn('Failed to remove job ' + jobIdToRemove + ' from queue (may already be gone):', err.message);
+    console.error('Unhandled error in DELETE /scheduled/' + req.params.broadcastId + ':', err.message);
+    return res.status(500).json({ error: 'An unexpected error occurred. Please try again.' });
   }
-
-  await task.deleteOne();
-
-  res.json({ success: true });
 });
 
 app.patch('/api/broadcast/scheduled/:broadcastId', authenticateToken, async function(req, res) {
-  const { message, scheduledTime, recipients } = req.body;
-  const task = await ScheduledBroadcast.findOne({ broadcastId: req.params.broadcastId, userId: req.user.id, status: 'pending' });
-
-  if (!task) return res.status(400).json({ error: 'Cannot edit this broadcast' });
-
-  // FIX: remove the old job using currentJobId (the versioned ID) rather than
-  // broadcastId, so we actually cancel the right job in BullMQ.
-  const oldJobId = task.currentJobId || task.broadcastId;
   try {
-    const oldJob = await broadcastQueue.getJob(oldJobId);
-    if (oldJob) {
-      await oldJob.remove();
-    }
-  } catch (err) {
-    console.warn('Failed to remove old job ' + oldJobId + ' on edit:', err.message);
-  }
+    const { message, scheduledTime, recipients } = req.body;
 
-  let needsUpdate = false;
-
-  if (message && message.trim()) {
-    const processed = message.trim();
-    if (processed.length > MAX_MSG_LENGTH * 10) {
-      return res.status(400).json({ error: 'Message too long' });
-    }
-    const readyMessage = prepareTelegramMessage(processed);
-    task.message = readyMessage;
-    needsUpdate = true;
-  }
-  if (recipients) {
-    task.recipients = recipients;
-    needsUpdate = true;
-  }
-  if (scheduledTime) {
-    const newTime = new Date(scheduledTime);
-    if (isNaN(newTime.getTime()) || newTime <= new Date()) return res.status(400).json({ error: 'Invalid future time' });
-    task.scheduledTime = newTime;
-    needsUpdate = true;
-  }
-
-  if (needsUpdate) {
-    const delay = task.scheduledTime.getTime() - Date.now();
-
-    // FIX: generate a fresh versioned jobId so BullMQ never silently ignores
-    // the add() because of a stale record for the previous jobId.
-    const newJobId = task.broadcastId + '_v' + Date.now();
-    task.currentJobId = newJobId;
-    await task.save();
-
-    let job;
+    let task;
     try {
-      job = await broadcastQueue.add('send-broadcast', {
-        userId: task.userId,
-        message: task.message,
-        broadcastId: task.broadcastId
-      }, {
-        jobId: newJobId,
-        delay: delay > 0 ? delay : 0,
-        attempts: 4,
-        backoff: { type: 'exponential', delay: 5000 }
+      task = await ScheduledBroadcast.findOne({
+        broadcastId: req.params.broadcastId,
+        userId: req.user.id,
+        status: 'pending'
       });
     } catch (err) {
-      console.error('Failed to re-queue broadcast ' + task.broadcastId + ' after edit:', err.message);
-      return res.status(500).json({ error: 'Broadcast updated in DB but failed to re-queue. It will be retried on next server restart.' });
+      console.error('DB lookup failed in PATCH /scheduled/' + req.params.broadcastId + ':', err.message);
+      return res.status(500).json({ error: 'Database error. Please try again.' });
     }
 
-    console.log('✏️  Broadcast ' + task.broadcastId + ' updated and re-queued: job ' + job.id + ' delay ' + Math.round((delay > 0 ? delay : 0) / 1000) + 's');
-  }
+    if (!task) return res.status(400).json({ error: 'Broadcast not found or cannot be edited.' });
 
-  res.json({ success: true, broadcastId: task.broadcastId, scheduledTime: task.scheduledTime.toISOString() });
+    // Remove the old queued job before making any changes
+    const oldJobId = task.currentJobId || task.broadcastId;
+    await safeRemoveJob(oldJobId);
+
+    let needsUpdate = false;
+
+    if (message && message.trim()) {
+      const processed = message.trim();
+      if (processed.length > MAX_MSG_LENGTH * 10) {
+        return res.status(400).json({ error: 'Message too long' });
+      }
+      task.message = prepareTelegramMessage(processed);
+      if (!task.message || task.message.length === 0) {
+        return res.status(400).json({ error: 'Message is empty after processing.' });
+      }
+      needsUpdate = true;
+    }
+
+    if (recipients) {
+      task.recipients = recipients;
+      needsUpdate = true;
+    }
+
+    if (scheduledTime) {
+      const newTime = new Date(scheduledTime);
+      if (isNaN(newTime.getTime())) {
+        return res.status(400).json({ error: 'Invalid scheduledTime format' });
+      }
+      // Truncate to minute — must align with stored scheduledMinute
+      newTime.setSeconds(0, 0);
+      if (newTime <= new Date()) {
+        return res.status(400).json({ error: 'Scheduled time must be in the future' });
+      }
+
+      const newMinute = getScheduledMinute(newTime);
+
+      // Only enforce uniqueness if the minute is actually changing
+      if (newMinute !== task.scheduledMinute) {
+        let collision;
+        try {
+          collision = await ScheduledBroadcast.findOne({
+            userId: req.user.id,
+            scheduledMinute: newMinute,
+            status: 'pending',
+            broadcastId: { $ne: task.broadcastId } // exclude the task being edited
+          });
+        } catch (err) {
+          console.error('Minute-collision check failed on edit for ' + req.user.id + ':', err.message);
+          return res.status(500).json({ error: 'Could not verify schedule slot. Please try again.' });
+        }
+
+        if (collision) {
+          return res.status(409).json({
+            error: 'You already have a broadcast scheduled at ' + newMinute.replace('T', ' ') + ' UTC. Please choose a different minute.'
+          });
+        }
+
+        task.scheduledTime = newTime;
+        task.scheduledMinute = newMinute;
+      } else {
+        task.scheduledTime = newTime;
+      }
+
+      needsUpdate = true;
+    }
+
+    if (!needsUpdate) {
+      // Nothing changed — re-queue the original job and return
+      const requeJobId = task.broadcastId + '_v' + Date.now();
+      task.currentJobId = requeJobId;
+      try {
+        await task.save();
+        await safeAddBroadcastJob(
+          { userId: task.userId, message: task.message, broadcastId: task.broadcastId },
+          {
+            jobId: requeJobId,
+            delay: Math.max(0, task.scheduledTime.getTime() - Date.now()),
+            attempts: 4,
+            backoff: { type: 'exponential', delay: 5000 }
+          }
+        );
+      } catch (err) {
+        console.error('Failed to re-queue unchanged broadcast ' + task.broadcastId + ':', err.message);
+      }
+      return res.json({ success: true, broadcastId: task.broadcastId, scheduledTime: task.scheduledTime.toISOString() });
+    }
+
+    const newJobId = task.broadcastId + '_v' + Date.now();
+    task.currentJobId = newJobId;
+
+    try {
+      await task.save();
+    } catch (err) {
+      // E11000 = unique index violation on scheduledMinute — race condition
+      if (err.code === 11000) {
+        return res.status(409).json({
+          error: 'You already have a broadcast scheduled at that minute. Please choose a different minute.'
+        });
+      }
+      console.error('Failed to save edited broadcast ' + task.broadcastId + ':', err.message);
+      return res.status(500).json({ error: 'Failed to save changes. Please try again.' });
+    }
+
+    const delay = Math.max(0, task.scheduledTime.getTime() - Date.now());
+    let job;
+    try {
+      job = await safeAddBroadcastJob(
+        { userId: task.userId, message: task.message, broadcastId: task.broadcastId },
+        { jobId: newJobId, delay: delay, attempts: 4, backoff: { type: 'exponential', delay: 5000 } }
+      );
+    } catch (err) {
+      console.error('Failed to re-queue broadcast ' + task.broadcastId + ' after edit:', err.message);
+      return res.status(500).json({
+        error: 'Changes saved but broadcast could not be re-queued. It will send at the scheduled time after a server restart.'
+      });
+    }
+
+    console.log('✏️  Broadcast ' + task.broadcastId + ' updated and re-queued: job ' + job.id + ' delay ' + Math.round(delay / 1000) + 's');
+    return res.json({ success: true, broadcastId: task.broadcastId, scheduledTime: task.scheduledTime.toISOString() });
+
+  } catch (err) {
+    console.error('Unhandled error in PATCH /scheduled/' + req.params.broadcastId + ':', err.message);
+    return res.status(500).json({ error: 'An unexpected error occurred. Please try again.' });
+  }
 });
 
 app.get('/api/broadcast/scheduled/:broadcastId/details', authenticateToken, async function(req, res) {
