@@ -280,6 +280,8 @@ const scheduledBroadcastSchema = new mongoose.Schema({
   message: String,
   recipients: { type: String, default: 'all' },
   scheduledTime: Date,
+  // FIX: stores "userId::YYYY-MM-DDTHH:MM" to enforce one broadcast per minute per user
+  minuteBucket: { type: String },
   status: { type: String, default: 'pending' },
   createdAt: Date,
 }, { timestamps: true });
@@ -287,6 +289,11 @@ const scheduledBroadcastSchema = new mongoose.Schema({
 scheduledBroadcastSchema.index({ userId: 1 });
 scheduledBroadcastSchema.index({ status: 1 });
 scheduledBroadcastSchema.index({ scheduledTime: 1 });
+// FIX: unique constraint — one pending broadcast per user per minute
+scheduledBroadcastSchema.index(
+  { userId: 1, minuteBucket: 1 },
+  { unique: true, partialFilterExpression: { status: 'pending', minuteBucket: { $exists: true } } }
+);
 
 const broadcastDailySchema = new mongoose.Schema({
   userId: { type: String, required: true },
@@ -615,19 +622,36 @@ function textToHtmlForDisplay(text) {
     .replace(/\n/g, '<br>');
 }
 
+// FIX: returns "userId::YYYY-MM-DDTHH:MM" — used as the per-minute uniqueness key
+function getMinuteBucket(userId, date) {
+  return userId + '::' + date.toISOString().slice(0, 16); // "YYYY-MM-DDTHH:MM"
+}
+
 function prepareTelegramMessage(raw) {
   if (!raw || typeof raw !== 'string') return '';
 
   let msg = raw.trim();
 
+  // FIX: normalise block-level HTML → newlines before sanitising.
+  // Order matters: closing+opening pairs first so we get a blank line between
+  // paragraphs, then strip the remaining lone open/close tags.
+  // FIX: use [\s]* so a literal newline between </p> and <p> is also matched.
   msg = msg
     .replace(/<br\s*\/?>/gi, '\n')
-    .replace(/<\/p>\s*<p[^>]*>/gi, '\n\n')
+    .replace(/<\/p>[\s]*<p[^>]*>/gi, '\n\n')
     .replace(/<p[^>]*>/gi, '')
     .replace(/<\/p>/gi, '\n')
     .replace(/<div[^>]*>/gi, '\n')
     .replace(/<\/div>/gi, '\n')
-    .replace(/\n{3,}/g, '\n\n');
+    .replace(/&nbsp;/gi, ' ')         // FIX: decode &nbsp; so it isn't sent as literal entity
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+
+  // FIX: if the entire message was HTML structure with no text content, return ''
+  // rather than letting sanitizeTelegramHtml return an empty/whitespace string
+  // that slips through the caller's length === 0 guard.
+  const stripped = msg.replace(/<[^>]+>/g, '').trim();
+  if (!stripped) return '';
 
   return sanitizeTelegramHtml(msg);
 }
@@ -740,6 +764,16 @@ async function processBroadcast(job) {
   const bot = activeBots.get(userId);
   if (!bot) {
     throw new Error('Telegram bot not connected for user ' + userId);
+  }
+
+  // FIX: verify the bot token is still valid before attempting to send to
+  // potentially thousands of subscribers. A 401 here is fast-fail; without
+  // this check every sendMessage() below would fail and we'd only find out
+  // after burning through the entire contact list.
+  try {
+    await bot.telegram.getMe();
+  } catch (tokenErr) {
+    throw new Error('Bot token invalid or revoked for user ' + userId + ': ' + tokenErr.message);
   }
 
   const chunks = splitTelegramMessage(message);
@@ -1784,8 +1818,9 @@ app.post('/api/broadcast/now', authenticateToken, async function(req, res) {
 
   const readyMessage = prepareTelegramMessage(processed);
 
-  if (readyMessage.length === 0) {
-    return res.status(400).json({ error: 'Message empty after processing' });
+  // FIX: prepareTelegramMessage now returns '' for HTML-only messages with no text content
+  if (!readyMessage) {
+    return res.status(400).json({ error: 'Message is empty after processing — check for unsupported HTML.' });
   }
 
   let job;
@@ -1847,6 +1882,25 @@ app.post('/api/broadcast/schedule', authenticateToken, async function(req, res) 
   }
 
   const readyMessage = prepareTelegramMessage(processed);
+
+  // FIX: catch empty message early (e.g. HTML-only input with no visible text)
+  if (!readyMessage) {
+    return res.status(400).json({ error: 'Message is empty after processing — check for unsupported HTML.' });
+  }
+
+  // FIX: enforce one broadcast per user per minute
+  const bucket = getMinuteBucket(req.user.id, time);
+  const conflict = await ScheduledBroadcast.findOne({
+    userId: req.user.id,
+    minuteBucket: bucket,
+    status: 'pending'
+  });
+  if (conflict) {
+    return res.status(409).json({
+      error: 'You already have a broadcast scheduled at that minute. Please choose a different time.'
+    });
+  }
+
   const broadcastId = uuidv4();
   const now = new Date();
   const delay = time.getTime() - Date.now();
@@ -1859,6 +1913,7 @@ app.post('/api/broadcast/schedule', authenticateToken, async function(req, res) 
     message: readyMessage,
     recipients: recipientsList,
     scheduledTime: time,
+    minuteBucket: bucket,   // FIX: stored for uniqueness enforcement
     status: 'pending',
     createdAt: now
   });
@@ -1943,6 +1998,10 @@ app.patch('/api/broadcast/scheduled/:broadcastId', authenticateToken, async func
       return res.status(400).json({ error: 'Message too long' });
     }
     const readyMessage = prepareTelegramMessage(processed);
+    // FIX: guard against empty message after processing
+    if (!readyMessage) {
+      return res.status(400).json({ error: 'Message is empty after processing — check for unsupported HTML.' });
+    }
     task.message = readyMessage;
     needsUpdate = true;
   }
@@ -1953,7 +2012,23 @@ app.patch('/api/broadcast/scheduled/:broadcastId', authenticateToken, async func
   if (scheduledTime) {
     const newTime = new Date(scheduledTime);
     if (isNaN(newTime.getTime()) || newTime <= new Date()) return res.status(400).json({ error: 'Invalid future time' });
+
+    // FIX: check no other pending broadcast from this user occupies the new minute
+    const newBucket = getMinuteBucket(task.userId, newTime);
+    const conflict = await ScheduledBroadcast.findOne({
+      userId: task.userId,
+      minuteBucket: newBucket,
+      status: 'pending',
+      broadcastId: { $ne: task.broadcastId }  // exclude self
+    });
+    if (conflict) {
+      return res.status(409).json({
+        error: 'You already have a broadcast scheduled at that minute. Please choose a different time.'
+      });
+    }
+
     task.scheduledTime = newTime;
+    task.minuteBucket = newBucket;  // FIX: update the bucket when the time changes
     needsUpdate = true;
   }
 
