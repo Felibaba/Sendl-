@@ -54,17 +54,20 @@ const BATCH_SIZE = 25;
 const BATCH_DELAY_MS = 1000;
 const MAX_MSG_LENGTH = 4000;
 
-// Redis + BullMQ setup
-let redisConnection;
-
-if (process.env.REDIS_URL) {
-  redisConnection = new IORedis(process.env.REDIS_URL, {
-    maxRetriesPerRequest: null,
-    enableReadyCheck: false
-  });
-} else {
+// ==================== REDIS CONNECTIONS ====================
+// BullMQ requires separate IORedis instances for Queue and Worker.
+// The Worker uses BLPOP (blocking pop) internally, which ties up the
+// connection. If Queue and Worker share one connection, published jobs
+// can never be delivered. Two connections pointing to the same URL fixes this.
+function createRedisConnection() {
+  if (process.env.REDIS_URL) {
+    return new IORedis(process.env.REDIS_URL, {
+      maxRetriesPerRequest: null,
+      enableReadyCheck: false
+    });
+  }
   console.warn('⚠️ WARNING: REDIS_URL not set in .env, falling back to localhost:6379');
-  redisConnection = new IORedis({
+  return new IORedis({
     host: 'localhost',
     port: 6379,
     maxRetriesPerRequest: null,
@@ -72,25 +75,40 @@ if (process.env.REDIS_URL) {
   });
 }
 
+const redisConnection = createRedisConnection();       // used by Queue (publisher)
+const workerRedisConnection = createRedisConnection(); // used by Worker (consumer)
+
 // ==================== REDIS DIAGNOSTICS ====================
 redisConnection.on('connect', function() {
-  console.log('✅ Redis connected');
+  console.log('✅ Redis (queue) connected');
 });
-
 redisConnection.on('ready', function() {
-  console.log('✅ Redis ready');
+  console.log('✅ Redis (queue) ready');
 });
-
 redisConnection.on('error', function(err) {
-  console.error('❌ Redis connection error:', err.message);
+  console.error('❌ Redis (queue) error:', err.message);
 });
-
 redisConnection.on('close', function() {
-  console.warn('⚠️ Redis connection closed');
+  console.warn('⚠️ Redis (queue) connection closed');
+});
+redisConnection.on('reconnecting', function() {
+  console.warn('🔄 Redis (queue) reconnecting...');
 });
 
-redisConnection.on('reconnecting', function() {
-  console.warn('🔄 Redis reconnecting...');
+workerRedisConnection.on('connect', function() {
+  console.log('✅ Redis (worker) connected');
+});
+workerRedisConnection.on('ready', function() {
+  console.log('✅ Redis (worker) ready');
+});
+workerRedisConnection.on('error', function(err) {
+  console.error('❌ Redis (worker) error:', err.message);
+});
+workerRedisConnection.on('close', function() {
+  console.warn('⚠️ Redis (worker) connection closed');
+});
+workerRedisConnection.on('reconnecting', function() {
+  console.warn('🔄 Redis (worker) reconnecting...');
 });
 
 const broadcastQueue = new Queue('telegram-broadcasts', { connection: redisConnection });
@@ -258,9 +276,6 @@ contactSchema.index({ userId: 1, status: 1 });
 const scheduledBroadcastSchema = new mongoose.Schema({
   broadcastId: { type: String, required: true, unique: true },
   userId: { type: String, required: true },
-  // FIX: track the current BullMQ jobId separately from broadcastId — the
-  // jobId changes on each edit (we append _vN) so we need to store it to be
-  // able to remove the right job on cancel/edit.
   currentJobId: { type: String },
   message: String,
   recipients: { type: String, default: 'all' },
@@ -669,9 +684,6 @@ function getUserLimits(user) {
   };
 }
 
-// FIX: wrapped in try/catch and returns 0 on failure so callers can handle
-// the error gracefully instead of crashing the route. Also uses $setOnInsert
-// for the initial count to prevent double-counting on race conditions.
 async function incrementDailyBroadcast(userId) {
   const today = getTodayDateString();
   try {
@@ -682,8 +694,6 @@ async function incrementDailyBroadcast(userId) {
     );
     return record.count;
   } catch (err) {
-    // E11000 = duplicate key — another request beat us to the upsert.
-    // Retry once as a plain findOneAndUpdate (no upsert) to get the real count.
     if (err.code === 11000) {
       try {
         const record = await BroadcastDaily.findOneAndUpdate(
@@ -702,9 +712,6 @@ async function incrementDailyBroadcast(userId) {
   }
 }
 
-// FIX: reads today's count WITHOUT incrementing — used to pre-check the limit
-// before deciding whether to increment, so a rejected broadcast doesn't burn
-// one of the user's daily slots.
 async function getDailyBroadcastCount(userId) {
   const today = getTodayDateString();
   try {
@@ -818,8 +825,9 @@ async function processBroadcast(job) {
   console.log('✅ Broadcast job ' + job.id + ' done: ' + sent + ' sent, ' + failed + ' failed out of ' + total);
 }
 
+// Worker uses its own dedicated Redis connection to avoid blocking the Queue's connection
 const worker = new Worker('telegram-broadcasts', processBroadcast, {
-  connection: redisConnection,
+  connection: workerRedisConnection,
   concurrency: 4
 });
 
@@ -913,8 +921,6 @@ async function recoverLostScheduledBroadcasts() {
   let alreadyExists = 0;
 
   for (const task of pendingFuture) {
-    // FIX: use currentJobId stored on the task if available, otherwise fall
-    // back to broadcastId for tasks created before this field existed.
     const jobId = task.currentJobId || task.broadcastId;
 
     try {
@@ -931,10 +937,6 @@ async function recoverLostScheduledBroadcasts() {
       }
 
       const delayMs = task.scheduledTime.getTime() - Date.now();
-
-      // FIX: generate a fresh jobId with timestamp suffix so BullMQ doesn't
-      // silently no-op the add() due to a stale completed/failed record for
-      // the same jobId still sitting in Redis.
       const newJobId = task.broadcastId + '_v' + Date.now();
 
       const addedJob = await broadcastQueue.add(
@@ -952,7 +954,6 @@ async function recoverLostScheduledBroadcasts() {
         }
       );
 
-      // Persist the new jobId so we can find and remove it on cancel/edit.
       await ScheduledBroadcast.updateOne(
         { broadcastId: task.broadcastId },
         { currentJobId: addedJob.id }
@@ -1693,7 +1694,6 @@ app.post('/api/subscribe/:shortId', formSubmitLimiter, async function(req, res) 
       contact.name = name.trim();
       contact.shortId = shortId;
       contact.submittedAt = new Date();
-      // FIX: was missing await contact.save() — changes were silently dropped
       await contact.save();
 
       pendingSubscribers.set(payload, {
@@ -1711,7 +1711,6 @@ app.post('/api/subscribe/:shortId', formSubmitLimiter, async function(req, res) 
     contact.name = name.trim();
     contact.shortId = shortId;
     contact.submittedAt = new Date();
-    // FIX: was missing await contact.save() for the non-subscribed update path too
     await contact.save();
   } else {
     contact = new Contact({
@@ -1763,8 +1762,6 @@ app.post('/api/broadcast/now', authenticateToken, async function(req, res) {
     return res.status(400).json({ error: 'Message too long' });
   }
 
-  // FIX: check the limit BEFORE incrementing so a rejected request doesn't
-  // burn one of the user's daily slots.
   const limits = getUserLimits(req.user);
   if (limits.dailyBroadcasts !== Infinity) {
     const currentCount = await getDailyBroadcastCount(req.user.id);
@@ -1773,8 +1770,6 @@ app.post('/api/broadcast/now', authenticateToken, async function(req, res) {
     }
   }
 
-  // FIX: wrap increment in try/catch so a DB error returns a clear 500
-  // instead of an unhandled rejection that crashes the route silently.
   let todayCount;
   try {
     todayCount = await incrementDailyBroadcast(req.user.id);
@@ -1783,7 +1778,6 @@ app.post('/api/broadcast/now', authenticateToken, async function(req, res) {
     return res.status(500).json({ error: 'Internal error — please try again.' });
   }
 
-  // Double-check in case two concurrent requests slipped through the pre-check
   if (todayCount > limits.dailyBroadcasts && limits.dailyBroadcasts !== Infinity) {
     return res.status(403).json({ error: 'Daily broadcast limit reached.' });
   }
@@ -1794,8 +1788,6 @@ app.post('/api/broadcast/now', authenticateToken, async function(req, res) {
     return res.status(400).json({ error: 'Message empty after processing' });
   }
 
-  // FIX: wrap queue.add in try/catch — if Redis is down the job add throws
-  // and we should return an error rather than hanging or crashing.
   let job;
   try {
     job = await broadcastQueue.add('send-broadcast', {
@@ -1829,13 +1821,11 @@ app.post('/api/broadcast/schedule', authenticateToken, async function(req, res) 
     return res.status(400).json({ error: 'Message too long' });
   }
 
-  // Validate time BEFORE touching daily counts
   const time = new Date(scheduledTime);
   if (isNaN(time.getTime()) || time <= new Date()) {
     return res.status(400).json({ error: 'Invalid future time' });
   }
 
-  // FIX: check limit BEFORE incrementing so invalid requests don't burn slots
   const limits = getUserLimits(req.user);
   if (limits.dailyBroadcasts !== Infinity) {
     const currentCount = await getDailyBroadcastCount(req.user.id);
@@ -1844,7 +1834,6 @@ app.post('/api/broadcast/schedule', authenticateToken, async function(req, res) 
     }
   }
 
-  // FIX: wrap increment in try/catch
   let todayCount;
   try {
     todayCount = await incrementDailyBroadcast(req.user.id);
@@ -1861,12 +1850,8 @@ app.post('/api/broadcast/schedule', authenticateToken, async function(req, res) 
   const broadcastId = uuidv4();
   const now = new Date();
   const delay = time.getTime() - Date.now();
-
-  // FIX: use a versioned jobId so BullMQ never silently ignores the add()
-  // due to a stale completed/failed record with the same ID still in Redis.
   const jobId = broadcastId + '_v1';
 
-  // Save to DB first so we have a record even if the queue add fails
   await ScheduledBroadcast.create({
     broadcastId: broadcastId,
     currentJobId: jobId,
@@ -1878,8 +1863,6 @@ app.post('/api/broadcast/schedule', authenticateToken, async function(req, res) 
     createdAt: now
   });
 
-  // FIX: wrap queue.add in try/catch — if Redis is down we still have the DB
-  // record and recovery on restart will re-queue it.
   let job;
   try {
     job = await broadcastQueue.add('send-broadcast', {
@@ -1894,7 +1877,6 @@ app.post('/api/broadcast/schedule', authenticateToken, async function(req, res) 
     });
   } catch (err) {
     console.error('Failed to queue scheduled broadcast ' + broadcastId + ' for ' + req.user.id + ':', err.message);
-    // Don't delete the DB record — recovery on restart will re-queue it
     return res.status(500).json({ error: 'Broadcast saved but failed to queue. It will be retried on next server restart.' });
   }
 
@@ -1922,9 +1904,6 @@ app.delete('/api/broadcast/scheduled/:broadcastId', authenticateToken, async fun
   const task = await ScheduledBroadcast.findOne({ broadcastId: broadcastId, userId: req.user.id });
   if (!task) return res.status(404).json({ error: 'Not found' });
 
-  // FIX: use currentJobId (the versioned ID) to find and remove the actual
-  // queued job. Falling back to broadcastId handles old records created before
-  // the currentJobId field was added.
   const jobIdToRemove = task.currentJobId || broadcastId;
   try {
     const job = await broadcastQueue.getJob(jobIdToRemove);
@@ -1946,8 +1925,6 @@ app.patch('/api/broadcast/scheduled/:broadcastId', authenticateToken, async func
 
   if (!task) return res.status(400).json({ error: 'Cannot edit this broadcast' });
 
-  // FIX: remove the old job using currentJobId (the versioned ID) rather than
-  // broadcastId, so we actually cancel the right job in BullMQ.
   const oldJobId = task.currentJobId || task.broadcastId;
   try {
     const oldJob = await broadcastQueue.getJob(oldJobId);
@@ -1982,9 +1959,6 @@ app.patch('/api/broadcast/scheduled/:broadcastId', authenticateToken, async func
 
   if (needsUpdate) {
     const delay = task.scheduledTime.getTime() - Date.now();
-
-    // FIX: generate a fresh versioned jobId so BullMQ never silently ignores
-    // the add() because of a stale record for the previous jobId.
     const newJobId = task.broadcastId + '_v' + Date.now();
     task.currentJobId = newJobId;
     await task.save();
@@ -2218,6 +2192,8 @@ process.on('SIGTERM', async function() {
   console.log('Shutting down gracefully...');
   await worker.close();
   await broadcastQueue.close();
+  redisConnection.disconnect();
+  workerRedisConnection.disconnect();
   process.exit(0);
 });
 
@@ -2225,6 +2201,8 @@ process.on('SIGINT', async function() {
   console.log('Shutting down gracefully...');
   await worker.close();
   await broadcastQueue.close();
+  redisConnection.disconnect();
+  workerRedisConnection.disconnect();
   process.exit(0);
 });
 
