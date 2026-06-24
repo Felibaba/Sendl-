@@ -1,5 +1,3 @@
-cd /home/workdir/artifacts
-cat > server.js << 'EOL'
 require('dotenv').config();
 
 const express = require('express');
@@ -576,7 +574,6 @@ function escapeHtml(unsafe) {
 
 function textToHtmlForDisplay(text) {
   if (!text) return '';
-  
   return text
     .replace(/\n{2,}/g, '</p><p>')
     .replace(/\n/g, '<br>');
@@ -586,7 +583,6 @@ function prepareTelegramMessage(raw) {
   if (!raw || typeof raw !== 'string') return '';
 
   let msg = raw.trim();
-
   msg = msg
     .replace(/<br\s*\/?>/gi, '\n')
     .replace(/<\/p>\s*<p[^>]*>/gi, '\n\n')
@@ -661,7 +657,7 @@ async function incrementDailyBroadcast(userId) {
   return record.count;
 }
 
-// ==================== BullMQ Worker - FIXED WITH ROBUST ERROR HANDLING ====================
+// ==================== BullMQ Worker ====================
 async function processBroadcast(job) {
   console.log(`[Broadcast Worker] Starting job ${job.id} for user ${job.data.userId}`);
 
@@ -690,10 +686,6 @@ async function processBroadcast(job) {
   let failed = 0;
 
   console.log(`[Broadcast Worker] Found ${total} targets for user ${userId}`);
-
-  if (total === 0) {
-    console.log(`[Broadcast Worker] No targets for user ${userId}`);
-  }
 
   const batches = [];
   for (let i = 0; i < targets.length; i += BATCH_SIZE) {
@@ -1638,13 +1630,12 @@ app.post('/api/contacts/delete', authenticateToken, async function(req, res) {
   res.json({ success: true, deletedCount: result.deletedCount });
 });
 
-// ==================== FIXED BROADCAST ENDPOINTS ====================
+// ==================== BROADCAST ENDPOINTS (FIXED) ====================
 app.post('/api/broadcast/now', authenticateToken, async function(req, res) {
-  console.log(`[Broadcast Now] Request received from user ${req.user.id}`);
+  console.log(`[Broadcast Now] Request from user ${req.user.id}`);
 
   const { message } = req.body;
   if (!message || !message.trim()) {
-    console.log('[Broadcast Now] Empty message');
     return res.status(400).json({ error: 'Message required' });
   }
 
@@ -1661,7 +1652,6 @@ app.post('/api/broadcast/now', authenticateToken, async function(req, res) {
   }
 
   const readyMessage = prepareTelegramMessage(processed);
-
   if (readyMessage.length === 0) {
     return res.status(400).json({ error: 'Message empty after processing' });
   }
@@ -1676,21 +1666,21 @@ app.post('/api/broadcast/now', authenticateToken, async function(req, res) {
       removeOnComplete: true
     });
 
-    console.log(`[Broadcast Now] Job ${job.id} queued successfully for user ${req.user.id}`);
+    console.log(`[Broadcast Now] Job ${job.id} queued for user ${req.user.id}`);
 
     res.json({ 
       success: true, 
       jobId: job.id,
-      message: 'Broadcast queued and sending in background. You will receive a delivery report via Telegram shortly.' 
+      message: 'Broadcast queued. Delivery report will be sent via Telegram.' 
     });
   } catch (err) {
-    console.error('[Broadcast Now] Failed to queue job:', err);
-    res.status(500).json({ error: 'Failed to queue broadcast. Please try again.' });
+    console.error('[Broadcast Now] Queue error:', err);
+    res.status(500).json({ error: 'Failed to queue broadcast' });
   }
 });
 
 app.post('/api/broadcast/schedule', authenticateToken, async function(req, res) {
-  console.log(`[Broadcast Schedule] Request received from user ${req.user.id}`);
+  console.log(`[Broadcast Schedule] Request from user ${req.user.id}`);
 
   const { message, scheduledTime, recipients = 'all' } = req.body;
   if (!message || !message.trim()) {
@@ -1713,19 +1703,16 @@ app.post('/api/broadcast/schedule', authenticateToken, async function(req, res) 
     return res.status(400).json({ error: 'Invalid future time' });
   }
 
-  // Prevent duplicate scheduling in the same minute
-  const minuteKey = time.toISOString().slice(0, 16); // YYYY-MM-DDTHH:mm
+  // Prevent 2 broadcasts in same minute
+  const minuteStart = new Date(time.getFullYear(), time.getMonth(), time.getDate(), time.getHours(), time.getMinutes());
   const existingInMinute = await ScheduledBroadcast.countDocuments({
     userId: req.user.id,
-    scheduledTime: {
-      $gte: new Date(minuteKey),
-      $lt: new Date(new Date(minuteKey).getTime() + 60000)
-    },
+    scheduledTime: { $gte: minuteStart, $lt: new Date(minuteStart.getTime() + 60000) },
     status: 'pending'
   });
 
   if (existingInMinute > 0) {
-    return res.status(409).json({ error: 'You already have a broadcast scheduled in this minute. Please choose a different time.' });
+    return res.status(409).json({ error: 'You already have a broadcast scheduled in this minute. Choose a different time.' });
   }
 
   const readyMessage = prepareTelegramMessage(processed);
@@ -1754,7 +1741,7 @@ app.post('/api/broadcast/schedule', authenticateToken, async function(req, res) 
       backoff: { type: 'exponential', delay: 8000 }
     });
 
-    console.log(`[Broadcast Schedule] Job ${broadcastId} scheduled successfully for ${time}`);
+    console.log(`[Broadcast Schedule] Scheduled ${broadcastId} for ${time}`);
 
     res.json({ 
       success: true, 
@@ -1762,9 +1749,9 @@ app.post('/api/broadcast/schedule', authenticateToken, async function(req, res) 
       scheduledTime: time.toISOString() 
     });
   } catch (err) {
-    console.error('[Broadcast Schedule] Failed to queue job:', err);
+    console.error('[Broadcast Schedule] Queue error:', err);
     await ScheduledBroadcast.deleteOne({ broadcastId });
-    res.status(500).json({ error: 'Failed to schedule broadcast. Please try again.' });
+    res.status(500).json({ error: 'Failed to schedule broadcast' });
   }
 });
 
@@ -1788,12 +1775,9 @@ app.delete('/api/broadcast/scheduled/:broadcastId', authenticateToken, async fun
   if (!task) return res.status(404).json({ error: 'Not found' });
 
   const job = await broadcastQueue.getJob(broadcastId);
-  if (job) {
-    await job.remove();
-  }
+  if (job) await job.remove();
 
   await task.deleteOne();
-
   res.json({ success: true });
 });
 
@@ -1804,19 +1788,14 @@ app.patch('/api/broadcast/scheduled/:broadcastId', authenticateToken, async func
   if (!task) return res.status(400).json({ error: 'Cannot edit this broadcast' });
 
   const oldJob = await broadcastQueue.getJob(task.broadcastId);
-  if (oldJob) {
-    await oldJob.remove();
-  }
+  if (oldJob) await oldJob.remove();
 
   let needsUpdate = false;
 
   if (message && message.trim()) {
     const processed = message.trim();
-    if (processed.length > MAX_MSG_LENGTH * 10) {
-      return res.status(400).json({ error: 'Message too long' });
-    }
-    const readyMessage = prepareTelegramMessage(processed);
-    task.message = readyMessage;
+    if (processed.length > MAX_MSG_LENGTH * 10) return res.status(400).json({ error: 'Message too long' });
+    task.message = prepareTelegramMessage(processed);
     needsUpdate = true;
   }
   if (recipients) {
@@ -1826,22 +1805,16 @@ app.patch('/api/broadcast/scheduled/:broadcastId', authenticateToken, async func
   if (scheduledTime) {
     const newTime = new Date(scheduledTime);
     if (isNaN(newTime.getTime()) || newTime <= new Date()) return res.status(400).json({ error: 'Invalid future time' });
-    
-    // Check duplicate in new minute
-    const minuteKey = newTime.toISOString().slice(0, 16);
-    const existingInMinute = await ScheduledBroadcast.countDocuments({
+
+    const minuteStart = new Date(newTime.getFullYear(), newTime.getMonth(), newTime.getDate(), newTime.getHours(), newTime.getMinutes());
+    const existing = await ScheduledBroadcast.countDocuments({
       userId: req.user.id,
-      scheduledTime: {
-        $gte: new Date(minuteKey),
-        $lt: new Date(new Date(minuteKey).getTime() + 60000)
-      },
+      scheduledTime: { $gte: minuteStart, $lt: new Date(minuteStart.getTime() + 60000) },
       broadcastId: { $ne: task.broadcastId },
       status: 'pending'
     });
 
-    if (existingInMinute > 0) {
-      return res.status(409).json({ error: 'Another broadcast already scheduled in this minute.' });
-    }
+    if (existing > 0) return res.status(409).json({ error: 'Another broadcast already scheduled in this minute.' });
 
     task.scheduledTime = newTime;
     needsUpdate = true;
@@ -1849,9 +1822,7 @@ app.patch('/api/broadcast/scheduled/:broadcastId', authenticateToken, async func
 
   if (needsUpdate) {
     await task.save();
-
     const delay = task.scheduledTime.getTime() - Date.now();
-
     await broadcastQueue.add('send-broadcast', {
       userId: task.userId,
       message: task.message,
@@ -1869,7 +1840,6 @@ app.patch('/api/broadcast/scheduled/:broadcastId', authenticateToken, async func
 
 app.get('/api/broadcast/scheduled/:broadcastId/details', authenticateToken, async function(req, res) {
   const task = await ScheduledBroadcast.findOne({ broadcastId: req.params.broadcastId, userId: req.user.id });
-
   if (!task || task.status !== 'pending') {
     return res.status(404).json({ error: 'Broadcast not found or not editable' });
   }
@@ -1892,58 +1862,52 @@ app.get('/admin-limits', async function(req, res) {
   const totalUsers = await User.countDocuments({});
   const payingUsers = await User.countDocuments({ isSubscribed: true, subscriptionEndDate: { $gt: new Date() } });
 
-  const html = '<!DOCTYPE html>\n' +
-    '<html lang="en">\n' +
-    '<head>\n' +
-    '  <meta charset="UTF-8">\n' +
-    '  <meta name="viewport" content="width=device-width, initial-scale=1.0">\n' +
-    '  <title>Server Admin Panel</title>\n' +
-    '  <style>\n' +
-    '    body { font-family: \'Segoe UI\', sans-serif; background: #121212; color: #e0e0e0; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; }\n' +
-    '    .container { background: #1e1e1e; padding: 40px; border-radius: 12px; box-shadow: 0 8px 32px rgba(0,0,0,0.6); width: 90%; max-width: 600px; }\n' +
-    '    h1 { text-align: center; color: #ffd700; margin-bottom: 30px; }\n' +
-    '    .stats { display: grid; grid-template-columns: 1fr 1fr; gap: 15px; margin-bottom: 30px; }\n' +
-    '    .stat-box { background: #2d2d2d; padding: 20px; border-radius: 10px; text-align: center; }\n' +
-    '    .stat-number { font-size: 2.5em; font-weight: bold; color: #00ff41; margin: 10px 0; }\n' +
-    '    .stat-label { font-size: 1.1em; color: #aaa; }\n' +
-    '    label { display: block; margin: 20px 0 8px; font-size: 1.1em; }\n' +
-    '    input[type="number"], input[type="password"] { width: 100%; padding: 12px; background: #2d2d2d; border: none; border-radius: 6px; color: white; font-size: 1em; margin-bottom: 15px; }\n' +
-    '    button { width: 100%; padding: 14px; background: #ffd700; color: black; font-weight: bold; border: none; border-radius: 6px; cursor: pointer; font-size: 1.1em; margin-top: 20px; }\n' +
-    '    button:hover { background: #e6c200; }\n' +
-    '    .current { text-align: center; margin: 25px 0; padding: 15px; background: #2d2d2d; border-radius: 8px; font-size: 1.1em; }\n' +
-    '  </style>\n' +
-    '</head>\n' +
-    '<body>\n' +
-    '  <div class="container">\n' +
-    '    <h1>Server Admin Panel</h1>\n' +
-    '    <div class="stats">\n' +
-    '      <div class="stat-box">\n' +
-    '        <div class="stat-number">' + totalUsers + '</div>\n' +
-    '        <div class="stat-label">Total Users</div>\n' +
-    '      </div>\n' +
-    '      <div class="stat-box">\n' +
-    '        <div class="stat-number">' + payingUsers + '</div>\n' +
-    '        <div class="stat-label">Paying Users</div>\n' +
-    '      </div>\n' +
-    '    </div>\n' +
-    '    <form method="POST">\n' +
-    '      <label>Owner Password</label>\n' +
-    '      <input type="password" name="password" required placeholder="Enter admin password">\n' +
-    '      <label>Daily Broadcasts per User (Free)</label>\n' +
-    '      <input type="number" name="daily_broadcast" min="1" value="' + adminSettingsCache.dailyBroadcastLimit + '" required>\n' +
-    '      <label>Max Landing Pages per User (Free)</label>\n' +
-    '      <input type="number" name="max_pages" min="1" value="' + adminSettingsCache.maxLandingPages + '" required>\n' +
-    '      <label>Max Forms per User (Free)</label>\n' +
-    '      <input type="number" name="max_forms" min="1" value="' + adminSettingsCache.maxForms + '" required>\n' +
-    '      <div class="current">\n' +
-    '        <strong>Current Free Tier Limits:</strong><br>\n' +
-    '        Broadcasts/day: ' + adminSettingsCache.dailyBroadcastLimit + ' | Pages: ' + adminSettingsCache.maxLandingPages + ' | Forms: ' + adminSettingsCache.maxForms + '\n' +
-    '      </div>\n' +
-    '      <button type="submit">Update Limits</button>\n' +
-    '    </form>\n' +
-    '  </div>\n' +
-    '</body>\n' +
-    '</html>';
+  const html = `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Server Admin Panel</title>
+  <style>
+    body { font-family: 'Segoe UI', sans-serif; background: #121212; color: #e0e0e0; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; }
+    .container { background: #1e1e1e; padding: 40px; border-radius: 12px; box-shadow: 0 8px 32px rgba(0,0,0,0.6); width: 90%; max-width: 600px; }
+    h1 { text-align: center; color: #ffd700; margin-bottom: 30px; }
+    .stats { display: grid; grid-template-columns: 1fr 1fr; gap: 15px; margin-bottom: 30px; }
+    .stat-box { background: #2d2d2d; padding: 20px; border-radius: 10px; text-align: center; }
+    .stat-number { font-size: 2.5em; font-weight: bold; color: #00ff41; margin: 10px 0; }
+    .stat-label { font-size: 1.1em; color: #aaa; }
+    label { display: block; margin: 20px 0 8px; font-size: 1.1em; }
+    input[type="number"], input[type="password"] { width: 100%; padding: 12px; background: #2d2d2d; border: none; border-radius: 6px; color: white; font-size: 1em; margin-bottom: 15px; }
+    button { width: 100%; padding: 14px; background: #ffd700; color: black; font-weight: bold; border: none; border-radius: 6px; cursor: pointer; font-size: 1.1em; margin-top: 20px; }
+    button:hover { background: #e6c200; }
+    .current { text-align: center; margin: 25px 0; padding: 15px; background: #2d2d2d; border-radius: 8px; font-size: 1.1em; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>Server Admin Panel</h1>
+    <div class="stats">
+      <div class="stat-box"><div class="stat-number">${totalUsers}</div><div class="stat-label">Total Users</div></div>
+      <div class="stat-box"><div class="stat-number">${payingUsers}</div><div class="stat-label">Paying Users</div></div>
+    </div>
+    <form method="POST">
+      <label>Owner Password</label>
+      <input type="password" name="password" required placeholder="Enter admin password">
+      <label>Daily Broadcasts per User (Free)</label>
+      <input type="number" name="daily_broadcast" min="1" value="${adminSettingsCache.dailyBroadcastLimit}" required>
+      <label>Max Landing Pages per User (Free)</label>
+      <input type="number" name="max_pages" min="1" value="${adminSettingsCache.maxLandingPages}" required>
+      <label>Max Forms per User (Free)</label>
+      <input type="number" name="max_forms" min="1" value="${adminSettingsCache.maxForms}" required>
+      <div class="current">
+        <strong>Current Free Tier Limits:</strong><br>
+        Broadcasts/day: ${adminSettingsCache.dailyBroadcastLimit} | Pages: ${adminSettingsCache.maxLandingPages} | Forms: ${adminSettingsCache.maxForms}
+      </div>
+      <button type="submit">Update Limits</button>
+    </form>
+  </div>
+</body>
+</html>`;
   res.send(html);
 });
 
@@ -1975,33 +1939,16 @@ app.post('/admin-limits', async function(req, res) {
       maxForms: newForms
     };
 
-    console.log('Admin limits updated and saved to DB:', adminSettingsCache);
+    console.log('Admin limits updated:', adminSettingsCache);
 
-    res.send('<!DOCTYPE html>\n' +
-      '<html lang="en">\n' +
-      '<head>\n' +
-      '  <meta charset="UTF-8">\n' +
-      '  <title>Limits Updated</title>\n' +
-      '  <style>\n' +
-      '    body { font-family: \'Segoe UI\', sans-serif; background: #121212; color: #e0e0e0; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; }\n' +
-      '    .container { background: #1e1e1e; padding: 40px; border-radius: 12px; text-align: center; }\n' +
-      '    h1 { color: #4caf50; }\n' +
-      '    .success { font-size: 1.2em; margin: 20px 0; }\n' +
-      '    a { color: #ffd700; text-decoration: none; font-weight: bold; }\n' +
-      '    a:hover { text-decoration: underline; }\n' +
-      '  </style>\n' +
-      '</head>\n' +
-      '<body>\n' +
-      '  <div class="container">\n' +
-      '    <h1>Success!</h1>\n' +
-      '    <p class="success">Server limits updated and <strong>saved permanently</strong>:</p>\n' +
-      '    <p><strong>Daily Broadcasts:</strong> ' + newDaily + '<br>\n' +
-      '       <strong>Max Pages:</strong> ' + newPages + '<br>\n' +
-      '       <strong>Max Forms:</strong> ' + newForms + '</p>\n' +
-      '    <p><a href="/admin-limits">← Back to Control Panel</a></p>\n' +
-      '  </div>\n' +
-      '</body>\n' +
-      '</html>');
+    res.send(`<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="UTF-8"><title>Limits Updated</title>
+<style>body { font-family: 'Segoe UI', sans-serif; background: #121212; color: #e0e0e0; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; }
+.container { background: #1e1e1e; padding: 40px; border-radius: 12px; text-align: center; } h1 { color: #4caf50; }</style>
+</head>
+<body><div class="container"><h1>Success!</h1><p>Limits updated and saved permanently.</p>
+<p><a href="/admin-limits">← Back</a></p></div></body></html>`);
   } catch (err) {
     console.error('Failed to save admin settings:', err);
     res.status(500).send('Failed to save settings');
@@ -2072,10 +2019,6 @@ app.use(function(req, res) {
 });
 
 app.listen(PORT, function() {
-  console.log('\nSENDEM SERVER — FULL VERSION WITH BullMQ + Redis BROADCAST QUEUE (FIXED)');
-  console.log('Server running on port ' + PORT + ' | Domain: https://' + DOMAIN + '\n');
+  console.log('\n✅ SENDEM SERVER STARTED SUCCESSFULLY');
+  console.log('Port: ' + PORT + ' | Domain: https://' + DOMAIN + '\n');
 });
-EOL
-echo "Server code updated with fixes"
-ls -la
-node --version
