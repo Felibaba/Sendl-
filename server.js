@@ -1,3 +1,5 @@
+cd /home/workdir/artifacts
+cat > server.js << 'EOL'
 require('dotenv').config();
 
 const express = require('express');
@@ -16,7 +18,7 @@ const { Queue, Worker } = require('bullmq');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-('trust proxy', 3);
+app.set('trust proxy', 3);
 
 // ==================== CONFIG & SECRETS ====================
 const JWT_SECRET = process.env.JWT_SECRET || 'fallback_weak_secret_change_me_immediately';
@@ -72,7 +74,13 @@ if (process.env.REDIS_URL) {
   });
 }
 
-const broadcastQueue = new Queue('telegram-broadcasts', { connection: redisConnection });
+const broadcastQueue = new Queue('telegram-broadcasts', { 
+  connection: redisConnection,
+  defaultJobOptions: {
+    removeOnComplete: true,
+    removeOnFail: { count: 50 }
+  }
+});
 
 // ==================== CONTACT VALIDATION REGEX ====================
 const CONTACT_REGEX = /^(\+?[0-9\s\-\(\)]{7,20}|[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})$/;
@@ -290,7 +298,6 @@ const lastWebhookSetTime = new Map();
 
 // ==================== TELEGRAM BOT MANAGEMENT ====================
 function launchUserBot(user) {
-  // Remove old bot instance without calling .stop() (not needed in pure webhook mode)
   if (activeBots.has(user.id)) {
     activeBots.delete(user.id);
     console.log('Removed old bot instance for user ' + user.email + ' without stopping (webhook mode)');
@@ -430,7 +437,7 @@ function launchUserBot(user) {
       await new Promise(resolve => setTimeout(resolve, 2500));
 
       let attempts = 0;
-      const maxAttempts = 5; // Increased attempts for network reliability
+      const maxAttempts = 5;
 
       while (attempts < maxAttempts) {
         try {
@@ -455,7 +462,7 @@ function launchUserBot(user) {
             if (attempts >= maxAttempts) {
               throw err;
             }
-            await new Promise(r => setTimeout(r, 5000)); // Extra delay on failure
+            await new Promise(r => setTimeout(r, 5000));
           }
         }
       }
@@ -464,7 +471,6 @@ function launchUserBot(user) {
     } catch (err) {
       console.error('Webhook setup completely failed for ' + user.email + ': ' + err.message);
     } finally {
-      // Always register the bot instance even if webhook failed (it can still handle incoming updates)
       activeBots.set(user.id, bot);
     }
   })();
@@ -655,12 +661,19 @@ async function incrementDailyBroadcast(userId) {
   return record.count;
 }
 
-// ==================== BullMQ Worker ====================
+// ==================== BullMQ Worker - FIXED WITH ROBUST ERROR HANDLING ====================
 async function processBroadcast(job) {
+  console.log(`[Broadcast Worker] Starting job ${job.id} for user ${job.data.userId}`);
+
   const { userId, message, broadcastId } = job.data;
+
+  if (!message || typeof message !== 'string') {
+    throw new Error('Invalid message in broadcast job');
+  }
 
   const bot = activeBots.get(userId);
   if (!bot) {
+    console.error(`[Broadcast Worker] Bot not found for user ${userId}`);
     throw new Error('Telegram bot not connected');
   }
 
@@ -670,11 +683,17 @@ async function processBroadcast(job) {
     userId: userId,
     status: 'subscribed',
     telegramChatId: { $exists: true, $ne: null }
-  });
+  }).lean();
 
   const total = targets.length;
   let sent = 0;
   let failed = 0;
+
+  console.log(`[Broadcast Worker] Found ${total} targets for user ${userId}`);
+
+  if (total === 0) {
+    console.log(`[Broadcast Worker] No targets for user ${userId}`);
+  }
 
   const batches = [];
   for (let i = 0; i < targets.length; i += BATCH_SIZE) {
@@ -683,23 +702,30 @@ async function processBroadcast(job) {
 
   for (let b = 0; b < batches.length; b++) {
     const batch = batches[b];
+    console.log(`[Broadcast Worker] Processing batch \( {b + 1}/ \){batches.length} for user ${userId}`);
 
     const sendPromises = batch.map(async function(target) {
       try {
         for (const chunk of chunks) {
-          await bot.telegram.sendMessage(target.telegramChatId, chunk, { parse_mode: 'HTML' });
+          await bot.telegram.sendMessage(target.telegramChatId, chunk, { 
+            parse_mode: 'HTML',
+            disable_web_page_preview: true 
+          });
         }
         sent++;
       } catch (err) {
         failed++;
+        console.error(`[Broadcast Worker] Failed to send to ${target.telegramChatId}:`, err.message);
+        
         const isBlocked = err.response?.error_code === 403 ||
-          /blocked|forbidden|chat not found|deactivated/i.test(err.message || '');
+          /blocked|forbidden|chat not found|deactivated|user is deactivated/i.test(err.message || '');
+        
         if (isBlocked) {
           await Contact.findByIdAndUpdate(target._id, {
             status: 'unsubscribed',
             unsubscribedAt: new Date(),
             telegramChatId: null
-          });
+          }).catch(() => {});
         }
       }
     });
@@ -707,12 +733,14 @@ async function processBroadcast(job) {
     await Promise.all(sendPromises);
 
     if (b < batches.length - 1) {
+      console.log(`[Broadcast Worker] Waiting ${BATCH_INTERVAL_MS}ms before next batch`);
       await new Promise(resolve => setTimeout(resolve, BATCH_INTERVAL_MS));
     }
   }
 
   const user = await User.findOne({ id: userId });
   let reportText = broadcastId ? '<b>Scheduled Broadcast Report</b>\n\n' : '<b>Broadcast Report</b>\n\n';
+  
   if (total === 0) {
     reportText += 'No subscribed contacts with Telegram connected.';
   } else {
@@ -725,42 +753,53 @@ async function processBroadcast(job) {
   if (user && user.isTelegramConnected && user.telegramChatId && activeBots.has(userId)) {
     try {
       await bot.telegram.sendMessage(user.telegramChatId, reportText, { parse_mode: 'HTML' });
+      console.log(`[Broadcast Worker] Report sent to user ${userId}`);
     } catch (err) {
       console.error('Failed to send report to user ' + userId, err);
     }
   }
 
   if (broadcastId) {
-    await ScheduledBroadcast.deleteOne({ broadcastId: broadcastId });
+    await ScheduledBroadcast.deleteOne({ broadcastId: broadcastId }).catch(() => {});
   }
 
   invalidateUserCache(userId, 'contacts');
+  console.log(`[Broadcast Worker] Job ${job.id} completed successfully for user ${userId}`);
 }
 
 const worker = new Worker('telegram-broadcasts', processBroadcast, {
   connection: redisConnection,
-  concurrency: 4
+  concurrency: 3,
+  limiter: {
+    max: 1,
+    duration: 1000
+  }
 });
 
 worker.on('completed', function(job) {
-  console.log('Broadcast job (' + (job.id || 'immediate') + ') completed for user ' + job.data.userId);
+  console.log(`[Worker] Broadcast job ${job.id} completed for user ${job.data.userId}`);
 });
 
 worker.on('failed', async function(job, err) {
-  console.error('Broadcast job (' + (job.id || 'immediate') + ') failed permanently: ' + err.message);
-  const { userId, broadcastId } = job.data || {};
+  console.error(`[Worker] Broadcast job ${job?.id || 'unknown'} failed:`, err.message);
+  
+  const { userId, broadcastId } = job?.data || {};
+  
   if (broadcastId) {
-    await ScheduledBroadcast.findOneAndUpdate({ broadcastId: broadcastId }, { status: 'failed' }).catch(function() {});
+    await ScheduledBroadcast.findOneAndUpdate({ broadcastId: broadcastId }, { status: 'failed' }).catch(() => {});
   }
-  const user = await User.findOne({ id: userId });
-  if (user && user.isTelegramConnected && user.telegramChatId && activeBots.has(userId)) {
-    const bot = activeBots.get(userId);
-    const text = broadcastId 
-      ? '<b>Scheduled Broadcast Failed</b>\n\nFailed after retries.\nError: ' + err.message
-      : '<b>Broadcast Failed</b>\n\nFailed after retries.\nError: ' + err.message;
-    try {
-      await bot.telegram.sendMessage(user.telegramChatId, text, { parse_mode: 'HTML' });
-    } catch {}
+
+  if (userId) {
+    const user = await User.findOne({ id: userId });
+    if (user && user.isTelegramConnected && user.telegramChatId && activeBots.has(userId)) {
+      const bot = activeBots.get(userId);
+      const text = broadcastId 
+        ? '<b>Scheduled Broadcast Failed</b>\n\nFailed after retries.\nError: ' + err.message
+        : '<b>Broadcast Failed</b>\n\nFailed after retries.\nError: ' + err.message;
+      try {
+        await bot.telegram.sendMessage(user.telegramChatId, text, { parse_mode: 'HTML' });
+      } catch (e) {}
+    }
   }
 });
 
@@ -796,7 +835,7 @@ async function recoverLostScheduledBroadcasts() {
 
     const delayMs = task.scheduledTime.getTime() - Date.now();
 
-    if (delayMs <= 1000) {
+    try {
       await broadcastQueue.add(
         'send-broadcast',
         {
@@ -806,28 +845,18 @@ async function recoverLostScheduledBroadcasts() {
         },
         {
           jobId: task.broadcastId,
-          attempts: 4,
-          backoff: { type: 'exponential', delay: 5000 }
+          delay: delayMs > 0 ? delayMs : 0,
+          attempts: 5,
+          backoff: { 
+            type: 'exponential', 
+            delay: 10000 
+          }
         }
       );
-    } else {
-      await broadcastQueue.add(
-        'send-broadcast',
-        {
-          userId: task.userId,
-          message: task.message,
-          broadcastId: task.broadcastId
-        },
-        {
-          jobId: task.broadcastId,
-          delay: delayMs,
-          attempts: 4,
-          backoff: { type: 'exponential', delay: 5000 }
-        }
-      );
+      recovered++;
+    } catch (e) {
+      console.error('Failed to re-queue broadcast', task.broadcastId, e);
     }
-
-    recovered++;
   }
 
   console.log(
@@ -917,15 +946,14 @@ app.post('/api/auth/connect-telegram', authenticateToken, async function(req, re
     return res.status(400).json({ error: 'This bot is already linked to another account.' });
   }
 
-  // Retry validation for network issues
   let botInfo;
   let attempts = 0;
-  const maxAttempts = 7; // Increased retries
+  const maxAttempts = 7;
   while (attempts < maxAttempts) {
     attempts++;
     try {
       const response = await axios.get('https://api.telegram.org/bot' + token + '/getMe', {
-        timeout: 20000 // Increased timeout
+        timeout: 20000
       });
       if (!response.data.ok) {
         return res.status(400).json({ 
@@ -942,21 +970,19 @@ app.post('/api/auth/connect-telegram', authenticateToken, async function(req, re
       if (attempts >= maxAttempts) {
         return res.status(500).json({ error: 'Network error validating bot token. Please try again later.' });
       }
-      await new Promise(r => setTimeout(r, 8000)); // Longer backoff
+      await new Promise(r => setTimeout(r, 8000));
     }
   }
 
   const botUsername = botInfo.username.replace(/^@/, '');
 
-  // Clear old webhook if token is different
   if (req.user.telegramBotToken && req.user.telegramBotToken !== token) {
     try {
       await axios.post('https://api.telegram.org/bot' + req.user.telegramBotToken + '/deleteWebhook', {
         drop_pending_updates: true
       }, { timeout: 20000 });
-      console.log('Old webhook cleared before connecting new bot for user ' + req.user.id);
     } catch (err) {
-      console.warn('Failed to clear old webhook (may be invalid token): ' + err.message);
+      console.warn('Failed to clear old webhook: ' + err.message);
     }
   }
 
@@ -989,7 +1015,6 @@ app.post('/api/auth/change-bot-token', authenticateToken, async function(req, re
     return res.status(400).json({ error: 'This bot is already linked to another account.' });
   }
 
-  // Retry validation for network issues
   let botInfo;
   let attempts = 0;
   const maxAttempts = 7;
@@ -1020,13 +1045,11 @@ app.post('/api/auth/change-bot-token', authenticateToken, async function(req, re
 
   const botUsername = botInfo.username.replace(/^@/, '');
 
-  // Always clear old webhook on token change
   if (req.user.telegramBotToken) {
     try {
       await axios.post('https://api.telegram.org/bot' + req.user.telegramBotToken + '/deleteWebhook', {
         drop_pending_updates: true
       }, { timeout: 20000 });
-      console.log('Old webhook cleared on bot token change for user ' + req.user.id);
     } catch (err) {
       console.warn('Failed to clear old webhook on token change: ' + err.message);
     }
@@ -1051,19 +1074,16 @@ app.post('/api/auth/change-bot-token', authenticateToken, async function(req, re
 });
 
 app.post('/api/auth/disconnect-telegram', authenticateToken, async function(req, res) {
-  // Clear webhook via direct API
   if (req.user.telegramBotToken) {
     try {
       await axios.post('https://api.telegram.org/bot' + req.user.telegramBotToken + '/deleteWebhook', {
         drop_pending_updates: true
       }, { timeout: 20000 });
-      console.log('Webhook cleared on disconnect for user ' + req.user.id);
     } catch (err) {
       console.warn('Failed to clear webhook on disconnect: ' + err.message);
     }
   }
 
-  // Remove bot instance without .stop()
   if (activeBots.has(req.user.id)) {
     activeBots.delete(req.user.id);
   }
@@ -1618,10 +1638,15 @@ app.post('/api/contacts/delete', authenticateToken, async function(req, res) {
   res.json({ success: true, deletedCount: result.deletedCount });
 });
 
-// ==================== BROADCASTING ====================
+// ==================== FIXED BROADCAST ENDPOINTS ====================
 app.post('/api/broadcast/now', authenticateToken, async function(req, res) {
+  console.log(`[Broadcast Now] Request received from user ${req.user.id}`);
+
   const { message } = req.body;
-  if (!message || !message.trim()) return res.status(400).json({ error: 'Message required' });
+  if (!message || !message.trim()) {
+    console.log('[Broadcast Now] Empty message');
+    return res.status(400).json({ error: 'Message required' });
+  }
 
   const processed = message.trim();
   if (processed.length > MAX_MSG_LENGTH * 10) {
@@ -1630,6 +1655,7 @@ app.post('/api/broadcast/now', authenticateToken, async function(req, res) {
 
   const todayCount = await incrementDailyBroadcast(req.user.id);
   const limits = getUserLimits(req.user);
+  
   if (todayCount > limits.dailyBroadcasts && limits.dailyBroadcasts !== Infinity) {
     return res.status(403).json({ error: 'Daily broadcast limit reached.' });
   }
@@ -1640,23 +1666,36 @@ app.post('/api/broadcast/now', authenticateToken, async function(req, res) {
     return res.status(400).json({ error: 'Message empty after processing' });
   }
 
-  await broadcastQueue.add('send-broadcast', {
-    userId: req.user.id,
-    message: readyMessage
-  }, {
-    attempts: 4,
-    backoff: { type: 'exponential', delay: 5000 }
-  });
+  try {
+    const job = await broadcastQueue.add('send-broadcast', {
+      userId: req.user.id,
+      message: readyMessage
+    }, {
+      attempts: 5,
+      backoff: { type: 'exponential', delay: 8000 },
+      removeOnComplete: true
+    });
 
-  res.json({ 
-    success: true, 
-    message: 'Broadcast queued and sending in background. You will receive a delivery report via Telegram shortly.' 
-  });
+    console.log(`[Broadcast Now] Job ${job.id} queued successfully for user ${req.user.id}`);
+
+    res.json({ 
+      success: true, 
+      jobId: job.id,
+      message: 'Broadcast queued and sending in background. You will receive a delivery report via Telegram shortly.' 
+    });
+  } catch (err) {
+    console.error('[Broadcast Now] Failed to queue job:', err);
+    res.status(500).json({ error: 'Failed to queue broadcast. Please try again.' });
+  }
 });
 
 app.post('/api/broadcast/schedule', authenticateToken, async function(req, res) {
+  console.log(`[Broadcast Schedule] Request received from user ${req.user.id}`);
+
   const { message, scheduledTime, recipients = 'all' } = req.body;
-  if (!message || !message.trim()) return res.status(400).json({ error: 'Message required' });
+  if (!message || !message.trim()) {
+    return res.status(400).json({ error: 'Message required' });
+  }
 
   const processed = message.trim();
   if (processed.length > MAX_MSG_LENGTH * 10) {
@@ -1674,6 +1713,21 @@ app.post('/api/broadcast/schedule', authenticateToken, async function(req, res) 
     return res.status(400).json({ error: 'Invalid future time' });
   }
 
+  // Prevent duplicate scheduling in the same minute
+  const minuteKey = time.toISOString().slice(0, 16); // YYYY-MM-DDTHH:mm
+  const existingInMinute = await ScheduledBroadcast.countDocuments({
+    userId: req.user.id,
+    scheduledTime: {
+      $gte: new Date(minuteKey),
+      $lt: new Date(new Date(minuteKey).getTime() + 60000)
+    },
+    status: 'pending'
+  });
+
+  if (existingInMinute > 0) {
+    return res.status(409).json({ error: 'You already have a broadcast scheduled in this minute. Please choose a different time.' });
+  }
+
   const readyMessage = prepareTelegramMessage(processed);
   const broadcastId = uuidv4();
 
@@ -1688,18 +1742,30 @@ app.post('/api/broadcast/schedule', authenticateToken, async function(req, res) 
 
   const delay = time.getTime() - Date.now();
 
-  await broadcastQueue.add('send-broadcast', {
-    userId: req.user.id,
-    message: readyMessage,
-    broadcastId: broadcastId
-  }, {
-    jobId: broadcastId,
-    delay: delay,
-    attempts: 4,
-    backoff: { type: 'exponential', delay: 5000 }
-  });
+  try {
+    await broadcastQueue.add('send-broadcast', {
+      userId: req.user.id,
+      message: readyMessage,
+      broadcastId: broadcastId
+    }, {
+      jobId: broadcastId,
+      delay: delay > 0 ? delay : 0,
+      attempts: 5,
+      backoff: { type: 'exponential', delay: 8000 }
+    });
 
-  res.json({ success: true, broadcastId: broadcastId, scheduledTime: time.toISOString() });
+    console.log(`[Broadcast Schedule] Job ${broadcastId} scheduled successfully for ${time}`);
+
+    res.json({ 
+      success: true, 
+      broadcastId: broadcastId, 
+      scheduledTime: time.toISOString() 
+    });
+  } catch (err) {
+    console.error('[Broadcast Schedule] Failed to queue job:', err);
+    await ScheduledBroadcast.deleteOne({ broadcastId });
+    res.status(500).json({ error: 'Failed to schedule broadcast. Please try again.' });
+  }
 });
 
 app.get('/api/broadcast/scheduled', authenticateToken, async function(req, res) {
@@ -1760,6 +1826,23 @@ app.patch('/api/broadcast/scheduled/:broadcastId', authenticateToken, async func
   if (scheduledTime) {
     const newTime = new Date(scheduledTime);
     if (isNaN(newTime.getTime()) || newTime <= new Date()) return res.status(400).json({ error: 'Invalid future time' });
+    
+    // Check duplicate in new minute
+    const minuteKey = newTime.toISOString().slice(0, 16);
+    const existingInMinute = await ScheduledBroadcast.countDocuments({
+      userId: req.user.id,
+      scheduledTime: {
+        $gte: new Date(minuteKey),
+        $lt: new Date(new Date(minuteKey).getTime() + 60000)
+      },
+      broadcastId: { $ne: task.broadcastId },
+      status: 'pending'
+    });
+
+    if (existingInMinute > 0) {
+      return res.status(409).json({ error: 'Another broadcast already scheduled in this minute.' });
+    }
+
     task.scheduledTime = newTime;
     needsUpdate = true;
   }
@@ -1776,8 +1859,8 @@ app.patch('/api/broadcast/scheduled/:broadcastId', authenticateToken, async func
     }, {
       jobId: task.broadcastId,
       delay: delay > 0 ? delay : 0,
-      attempts: 4,
-      backoff: { type: 'exponential', delay: 5000 }
+      attempts: 5,
+      backoff: { type: 'exponential', delay: 8000 }
     });
   }
 
@@ -1989,7 +2072,10 @@ app.use(function(req, res) {
 });
 
 app.listen(PORT, function() {
-  console.log('\nSENDEM SERVER — FULL VERSION WITH BullMQ + Redis BROADCAST QUEUE');
+  console.log('\nSENDEM SERVER — FULL VERSION WITH BullMQ + Redis BROADCAST QUEUE (FIXED)');
   console.log('Server running on port ' + PORT + ' | Domain: https://' + DOMAIN + '\n');
 });
- 
+EOL
+echo "Server code updated with fixes"
+ls -la
+node --version
