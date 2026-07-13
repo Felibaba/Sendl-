@@ -16,7 +16,7 @@ const { Queue, Worker } = require('bullmq');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-('trust proxy', 3);
+app.set('trust proxy', 3);
 
 // ==================== CONFIG & SECRETS ====================
 const JWT_SECRET = process.env.JWT_SECRET || 'fallback_weak_secret_change_me_immediately';
@@ -73,6 +73,9 @@ if (process.env.REDIS_URL) {
 }
 
 const broadcastQueue = new Queue('telegram-broadcasts', { connection: redisConnection });
+
+// ==================== CONTACT VALIDATION REGEX ====================
+const CONTACT_REGEX = /^(\+?[0-9\s\-\(\)]{7,20}|[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})$/;
 
 // ==================== PER-USER & PUBLIC CACHE WITH TTL ====================
 const userCache = new Map();
@@ -282,6 +285,7 @@ broadcastDailySchema.index({ userId: 1, date: 1 }, { unique: true });
 // In-memory helpers
 const activeBots = new Map();
 const resetTokens = new Map();
+const pendingSubscribers = new Map();
 const lastWebhookSetTime = new Map();
 
 // ==================== TELEGRAM BOT MANAGEMENT ====================
@@ -310,9 +314,103 @@ function launchUserBot(user) {
   bot.start(async (ctx) => {
     const payload = ctx.startPayload || '';
     const chatId = ctx.chat.id.toString();
-    const tgUsername = ctx.chat.username || null;
 
-    // 2FA-connect flow for the account owner: /start <userId>
+    // ---- Subscription deep-link flow ----
+    if (payload.startsWith('sub_')) {
+      const pending = pendingSubscribers.get(payload);
+
+      // Payload not found in memory: either it expired (30 min TTL),
+      // the server restarted since the form was submitted, or the
+      // link was already used. Tell the person the real reason
+      // instead of the generic "Welcome!" message.
+      if (!pending) {
+        await ctx.replyWithHTML(
+          '<b>This subscription link has expired or was already used.</b>\n\n' +
+          'Please go back to the page and submit the form again to get a fresh link.'
+        );
+        return;
+      }
+
+      // Payload exists but belongs to a different bot/account. This can
+      // happen if a bot token is shared/reused incorrectly.
+      if (pending.userId !== user.id) {
+        await ctx.replyWithHTML(
+          '<b>This link isn\'t valid for this bot.</b>\n\n' +
+          'Please use the link from the page you subscribed on.'
+        );
+        return;
+      }
+
+      const sub = pending;
+
+      let targetContact = await Contact.findOne({
+        userId: user.id,
+        telegramChatId: chatId
+      });
+
+      const contactsByEmail = await Contact.find({ userId: user.id, contact: sub.contact });
+
+      if (!targetContact) {
+        targetContact = contactsByEmail.find(c => c.status === 'subscribed') ||
+                        contactsByEmail.find(c => c.shortId === sub.shortId) ||
+                        contactsByEmail[0];
+      }
+
+      if (!targetContact) {
+        targetContact = new Contact({
+          userId: user.id,
+          shortId: sub.shortId,
+          name: sub.name,
+          contact: sub.contact,
+          telegramChatId: chatId,
+          status: 'subscribed',
+          submittedAt: new Date(),
+          subscribedAt: new Date()
+        });
+      } else {
+        targetContact.name = sub.name;
+        targetContact.contact = sub.contact;
+        targetContact.shortId = sub.shortId;
+        targetContact.telegramChatId = chatId;
+        targetContact.status = 'subscribed';
+        targetContact.subscribedAt = targetContact.subscribedAt || new Date();
+        targetContact.submittedAt = new Date();
+      }
+
+      try {
+        await targetContact.save();
+
+        await Contact.deleteMany({
+          userId: user.id,
+          $or: [
+            { contact: sub.contact, _id: { $ne: targetContact._id } },
+            { telegramChatId: chatId, _id: { $ne: targetContact._id } }
+          ]
+        });
+      } catch (err) {
+        console.error('Failed to save contact for user ' + user.id + ': ' + err.message);
+        await ctx.replyWithHTML(
+          '<b>Something went wrong saving your subscription.</b>\n\n' +
+          'Please try submitting the form again. If this keeps happening, contact support.'
+        );
+        return;
+      }
+
+      pendingSubscribers.delete(payload);
+
+      const form = await FormPage.findOne({ shortId: sub.shortId });
+      let welcomeText = '<b>Subscription Confirmed!</b>\n\nHi <b>' + escapeHtml(sub.name) + '</b>!\n\nYou\'re now subscribed.\n\nThank you';
+
+      if (form && form.welcomeMessage && form.welcomeMessage.trim()) {
+        welcomeText = form.welcomeMessage
+          .replace(/\{name\}/gi, '<b>' + escapeHtml(sub.name) + '</b>')
+          .replace(/\{contact\}/gi, escapeHtml(sub.contact));
+      }
+
+      await ctx.replyWithHTML(welcomeText);
+      return;
+    }
+
     if (payload === user.id) {
       user.telegramChatId = chatId;
       user.isTelegramConnected = true;
@@ -321,65 +419,24 @@ function launchUserBot(user) {
       return;
     }
 
-    // ---- Simplified subscription flow ----
-    // No payload, no name/email form, no per-form segmentation. This bot
-    // belongs to exactly one account, so anyone who hits /start is simply
-    // subscribed under that account, identified only by their Telegram
-    // @username.
-    if (!tgUsername) {
-      await ctx.replyWithHTML(
-        '<b>Telegram Username Required</b>\n\n' +
-        'You need to set a Telegram username before you can subscribe.\n\n' +
-        'Go to Settings → Edit Profile → Username in Telegram, set one, then send /start again.'
-      );
-      return;
-    }
-
-    let contact = await Contact.findOne({ userId: user.id, telegramChatId: chatId });
-    if (!contact) {
-      contact = await Contact.findOne({ userId: user.id, contact: tgUsername });
-    }
-
-    if (!contact) {
-      contact = new Contact({
-        userId: user.id,
-        name: tgUsername,
-        contact: tgUsername,
-        telegramChatId: chatId,
-        status: 'subscribed',
-        submittedAt: new Date(),
-        subscribedAt: new Date()
-      });
-    } else {
-      contact.name = tgUsername;
-      contact.contact = tgUsername;
-      contact.telegramChatId = chatId;
-      contact.status = 'subscribed';
-      contact.subscribedAt = contact.subscribedAt || new Date();
-      contact.submittedAt = new Date();
-    }
-
-    await contact.save();
-
-    // De-dupe any stale rows for the same person
-    await Contact.deleteMany({
-      userId: user.id,
-      $or: [
-        { contact: tgUsername, _id: { $ne: contact._id } },
-        { telegramChatId: chatId, _id: { $ne: contact._id } }
-      ]
-    });
-
-    invalidateUserCache(user.id, 'contacts');
-
-    await ctx.replyWithHTML(
-      '<b>Subscription Confirmed!</b>\n\nHi <b>@' + escapeHtml(tgUsername) + '</b>!\n\nYou\'re now subscribed.\n\nThank you'
-    );
+    // No payload at all (bare /start) — this is the only case where the
+    // generic welcome message makes sense, since there's nothing to fail.
+    await ctx.replyWithHTML('<b>Welcome!</b>\n\nSubscribe from the page to get updates.');
   });
 
   bot.command('status', async (ctx) => {
     await ctx.replyWithHTML('<b>Sendm 2FA Status</b>\nAccount: <code>' + user.email + '</code>\nStatus: <b>' + (user.isTelegramConnected ? 'Connected' : 'Not Connected') + '</b>');
   });
+
+  // Register the bot instance IMMEDIATELY so the webhook route can
+  // route updates to it right away. Previously this only happened at
+  // the end of the async webhook-setup IIFE below, which meant any
+  // Telegram update arriving in that window (webhook deletion, the
+  // 4s+2.5s sleeps, retry backoffs, rate-limit waits) hit
+  // `activeBots.get(userId)` as undefined and was silently dropped —
+  // this is what caused subscribe to "stop working" right after
+  // connecting a bot until the next restart.
+  activeBots.set(user.id, bot);
 
   const webhookPath = '/webhook/' + WEBHOOK_SECRET + '/' + user.id;
   const webhookUrl = 'https://' + DOMAIN + webhookPath;
@@ -398,27 +455,32 @@ function launchUserBot(user) {
 
       if (alreadyCorrect && recentlySet) {
         console.log('Webhook already perfect & recent for ' + user.email + ' → skipping');
-        activeBots.set(user.id, bot);
         return;
       }
 
       if (alreadyCorrect) {
         console.log('Webhook correct but old → refreshing timestamp for ' + user.email);
         lastWebhookSetTime.set(user.id, Date.now());
-        activeBots.set(user.id, bot);
         return;
       }
 
       console.log('Webhook needs update for ' + user.email + ' → current: ' + (current.url || 'none'));
 
-      await bot.telegram.deleteWebhook({ drop_pending_updates: true });
-      console.log('Webhook cleaned for ' + user.email);
+      // NOTE: we deliberately do NOT drop_pending_updates during the
+      // deleteWebhook call below when a bot is already registered in
+      // activeBots, because Telegram queues updates while no webhook is
+      // set and delivers them once the new one is confirmed — losing
+      // "drop_pending_updates: true" here would silently discard any
+      // /start clicks that happen during this brief window. We only
+      // drop pending updates the very first time a bot is connected,
+      // when there's nothing meaningful to preserve.
+      const isFirstConnect = !lastWebhookSetTime.has(user.id);
 
-      await new Promise(resolve => setTimeout(resolve, 4000));
-      await new Promise(resolve => setTimeout(resolve, 2500));
+      await bot.telegram.deleteWebhook({ drop_pending_updates: isFirstConnect });
+      console.log('Webhook cleaned for ' + user.email + (isFirstConnect ? ' (dropped stale pending updates)' : ' (preserved pending updates)'));
 
       let attempts = 0;
-      const maxAttempts = 5; // Increased attempts for network reliability
+      const maxAttempts = 5;
 
       while (attempts < maxAttempts) {
         try {
@@ -429,7 +491,6 @@ function launchUserBot(user) {
           if (success) {
             console.log('Webhook SUCCESSFULLY set for @' + (user.botUsername || 'unknown') + ' → ' + webhookUrl);
             lastWebhookSetTime.set(user.id, Date.now());
-            activeBots.set(user.id, bot);
             return;
           }
         } catch (err) {
@@ -443,7 +504,7 @@ function launchUserBot(user) {
             if (attempts >= maxAttempts) {
               throw err;
             }
-            await new Promise(r => setTimeout(r, 5000)); // Extra delay on failure
+            await new Promise(r => setTimeout(r, 5000));
           }
         }
       }
@@ -451,9 +512,9 @@ function launchUserBot(user) {
       console.error('Gave up setting webhook for ' + user.email + ' after ' + maxAttempts + ' attempts');
     } catch (err) {
       console.error('Webhook setup completely failed for ' + user.email + ': ' + err.message);
-    } finally {
-      // Always register the bot instance even if webhook failed (it can still handle incoming updates)
-      activeBots.set(user.id, bot);
+      // Bot instance remains registered in activeBots regardless (set
+      // synchronously above), so it can still handle updates once
+      // Telegram is able to deliver them.
     }
   })();
 }
@@ -470,6 +531,20 @@ const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 10,
   message: { error: 'Too many attempts' }
+});
+
+const formSubmitLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  message: { error: 'Too many submissions to this form. Please try again later.' },
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: function(req) {
+    return req.ip + '::' + req.params.shortId;
+  },
+  skip: function(req) {
+    return !req.params.shortId;
+  }
 });
 
 // ==================== WEBHOOK ENDPOINT ====================
@@ -497,6 +572,11 @@ app.post('/webhook/' + WEBHOOK_SECRET + '/:userId', async (req, res) => {
     } catch (err) {
       console.error('Webhook handle error for user ' + userId + ':', err);
     }
+  } else {
+    // This should now only happen if a bot token was never connected for
+    // this userId at all (e.g. stale/forged webhook path), since
+    // launchUserBot registers the bot in activeBots synchronously.
+    console.warn('Received webhook update for user ' + userId + ' but no active bot instance is registered.');
   }
 
   res.sendStatus(200);
@@ -544,7 +624,7 @@ function escapeHtml(unsafe) {
 
 function textToHtmlForDisplay(text) {
   if (!text) return '';
-  
+
   return text
     .replace(/\n{2,}/g, '</p><p>')
     .replace(/\n/g, '<br>');
@@ -729,7 +809,7 @@ worker.on('failed', async function(job, err) {
   const user = await User.findOne({ id: userId });
   if (user && user.isTelegramConnected && user.telegramChatId && activeBots.has(userId)) {
     const bot = activeBots.get(userId);
-    const text = broadcastId 
+    const text = broadcastId
       ? '<b>Scheduled Broadcast Failed</b>\n\nFailed after retries.\nError: ' + err.message
       : '<b>Broadcast Failed</b>\n\nFailed after retries.\nError: ' + err.message;
     try {
@@ -902,8 +982,8 @@ app.post('/api/auth/connect-telegram', authenticateToken, async function(req, re
         timeout: 20000 // Increased timeout
       });
       if (!response.data.ok) {
-        return res.status(400).json({ 
-          error: 'Invalid bot token – Telegram rejected it: ' + (response.data.description || 'Unauthorized') 
+        return res.status(400).json({
+          error: 'Invalid bot token – Telegram rejected it: ' + (response.data.description || 'Unauthorized')
         });
       }
       botInfo = response.data.result;
@@ -974,8 +1054,8 @@ app.post('/api/auth/change-bot-token', authenticateToken, async function(req, re
         timeout: 20000
       });
       if (!response.data.ok) {
-        return res.status(400).json({ 
-          error: 'Invalid new token – Telegram rejected it: ' + (response.data.description || 'Unauthorized') 
+        return res.status(400).json({
+          error: 'Invalid new token – Telegram rejected it: ' + (response.data.description || 'Unauthorized')
         });
       }
       botInfo = response.data.result;
@@ -1246,9 +1326,9 @@ app.get('/p/:shortId', async function(req, res) {
     return block;
   });
 
-  const data = { 
-    title: page.title, 
-    blocks: processedBlocks 
+  const data = {
+    title: page.title,
+    blocks: processedBlocks
   };
 
   publicCache.set(key, { data: data, timestamp: Date.now() });
@@ -1314,11 +1394,7 @@ app.get('/api/forms', authenticateToken, async function(req, res) {
       title: f.title,
       createdAt: f.createdAt,
       updatedAt: f.updatedAt,
-      url: protocol + '://' + host + '/f/' + f.shortId,
-      // Every form shares the same single subscribe link: straight to the
-      // bot, no payload, no segmentation. Anyone who /starts the bot is
-      // subscribed to this account directly.
-      subscribeLink: req.user.botUsername ? 'https://t.me/' + req.user.botUsername : null
+      url: protocol + '://' + host + '/f/' + f.shortId
     };
   });
 
@@ -1338,9 +1414,11 @@ app.get('/api/contacts', authenticateToken, async function(req, res) {
   const contacts = await Contact.find({ userId: req.user.id }).sort({ submittedAt: -1 });
   const formatted = contacts.map(function(c) {
     return {
-      username: '@' + c.contact,
+      name: c.name,
+      contact: c.contact,
       status: c.status,
-      // telegramChatId intentionally omitted from the dashboard payload
+      telegramChatId: c.telegramChatId || null,
+      pageId: c.shortId,
       submittedAt: new Date(c.submittedAt).toLocaleString(),
       subscribedAt: c.subscribedAt ? new Date(c.subscribedAt).toLocaleString() : null
     };
@@ -1508,11 +1586,87 @@ app.post('/api/forms/delete', authenticateToken, async function(req, res) {
   res.json({ success: true });
 });
 
-// ==================== CONTACTS ====================
-// Subscription now happens purely via /start in launchUserBot() above —
-// there is no web form, no name/email, and no per-request payload. Anyone
-// who starts the bot is added as a contact identified by their Telegram
-// @username. The routes below only manage already-collected contacts.
+// ==================== SUBSCRIBE & CONTACTS ====================
+app.post('/api/subscribe/:shortId', formSubmitLimiter, async function(req, res) {
+  const shortId = req.params.shortId;
+  const { name, email } = req.body;
+
+  if (!name || !name.trim()) return res.status(400).json({ error: 'Name is required' });
+  if (!email || !email.trim()) return res.status(400).json({ error: 'Contact is required' });
+
+  const contactValue = email.trim();
+
+  if (!CONTACT_REGEX.test(contactValue)) {
+    return res.status(400).json({ error: 'Contact must be a valid email address or phone number' });
+  }
+
+  const form = await FormPage.findOne({ shortId: shortId });
+  if (!form) return res.status(404).json({ error: 'Form not found' });
+
+  const owner = await User.findOne({ id: form.userId });
+  if (!owner || !owner.telegramBotToken || !owner.botUsername) return res.status(400).json({ error: 'Bot not connected' });
+
+  // Warn (but don't block) if the owner's bot instance isn't registered
+  // yet — e.g. webhook setup for a freshly connected bot is still in
+  // flight. It will now be registered synchronously by launchUserBot,
+  // so this should be rare; if it fires often, check server logs for
+  // "Webhook setup completely failed" for that user.
+  if (!activeBots.has(owner.id)) {
+    console.warn('Subscribe attempt for shortId ' + shortId + ' but owner bot instance not active yet.');
+  }
+
+  const payload = 'sub_' + shortId + '_' + uuidv4().slice(0, 12);
+
+  let contact = await Contact.findOne({ userId: owner.id, contact: contactValue });
+
+  if (contact) {
+    if (contact.status === 'subscribed') {
+      contact.name = name.trim();
+      contact.shortId = shortId;
+      contact.submittedAt = new Date();
+      await contact.save();
+
+      pendingSubscribers.set(payload, {
+        userId: owner.id,
+        shortId: shortId,
+        name: name.trim(),
+        contact: contactValue,
+        createdAt: Date.now()
+      });
+
+      const deepLink = 'https://t.me/' + owner.botUsername + '?start=' + payload;
+      return res.json({ success: true, deepLink: deepLink, alreadySubscribed: true });
+    }
+
+    contact.name = name.trim();
+    contact.shortId = shortId;
+    contact.submittedAt = new Date();
+  } else {
+    contact = new Contact({
+      userId: owner.id,
+      shortId: shortId,
+      name: name.trim(),
+      contact: contactValue,
+      status: 'pending',
+      submittedAt: new Date()
+    });
+    await contact.save();
+  }
+
+  pendingSubscribers.set(payload, {
+    userId: owner.id,
+    shortId: shortId,
+    name: name.trim(),
+    contact: contactValue,
+    createdAt: Date.now()
+  });
+
+  const deepLink = 'https://t.me/' + owner.botUsername + '?start=' + payload;
+  res.json({ success: true, deepLink: deepLink });
+
+  invalidateUserCache(owner.id, 'contacts');
+});
+
 app.post('/api/contacts/delete', authenticateToken, async function(req, res) {
   const { contacts } = req.body;
   if (!Array.isArray(contacts) || contacts.length === 0) return res.status(400).json({ error: 'Provide contact array' });
@@ -1557,9 +1711,9 @@ app.post('/api/broadcast/now', authenticateToken, async function(req, res) {
     backoff: { type: 'exponential', delay: 5000 }
   });
 
-  res.json({ 
-    success: true, 
-    message: 'Broadcast queued and sending in background. You will receive a delivery report via Telegram shortly.' 
+  res.json({
+    success: true,
+    message: 'Broadcast queued and sending in background. You will receive a delivery report via Telegram shortly.'
   });
 });
 
@@ -1833,6 +1987,18 @@ app.post('/admin-limits', async function(req, res) {
     res.status(500).send('Failed to save settings');
   }
 });
+
+// ==================== CLEANUP ====================
+setInterval(function() {
+  const now = Date.now();
+  const keys = Array.from(pendingSubscribers.keys());
+  for (const key of keys) {
+    const data = pendingSubscribers.get(key);
+    if (now - data.createdAt > 30 * 60 * 1000) {
+      pendingSubscribers.delete(key);
+    }
+  }
+}, 60 * 60 * 1000);
 
 // ==================== STARTUP ====================
 async function loadAdminSettings() {
