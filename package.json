@@ -1,11 +1,10 @@
 {
-  "name": "sendm-backend",
+  "name": "sendm",
   "version": "1.0.0",
-  "description": "Sendm - Telegram broadcast & landing page backend with BullMQ + Redis queue",
+  "private": true,
   "main": "server.js",
   "scripts": {
-    "start": "node server.js",
-    "dev": "nodemon server.js"
+    "start": "node server.js"
   },
   "engines": {
     "node": ">=18.0.0"
@@ -13,7 +12,7 @@
   "dependencies": {
     "axios": "^1.7.7",
     "bcryptjs": "^2.4.3",
-    "bullmq": "^5.12.12",
+    "bullmq": "^5.12.15",
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
     "ejs": "^3.1.10",
@@ -22,10 +21,8 @@
     "ioredis": "^5.4.1",
     "jsonwebtoken": "^9.0.2",
     "mongoose": "^8.6.3",
+    "sanitize-html": "^2.13.0",
     "telegraf": "^4.16.3",
     "uuid": "^10.0.0"
-  },
-  "devDependencies": {
-    "nodemon": "^3.1.4"
   }
 }
